@@ -151,6 +151,15 @@ function buildWindows(params: Record<string, unknown>): Window[] {
 
 function buildSlots(): RecipeSlotDef[] {
   return [
+    // Zone — required for UI scoping (recipes are listed per zone). Also
+    // used as the default hint for picking the pump.
+    {
+      id: "zone",
+      name: "Zone",
+      description: "Zone the pool pump belongs to",
+      type: "zone",
+      required: true,
+    },
     {
       id: "pump",
       name: "Pool pump",
@@ -224,6 +233,7 @@ const FR: RecipeLangPack = {
   name: "Programmation pompe piscine",
   description: "Plages horaires on/off pour la pompe de piscine — jusqu'à 3 créneaux par jour",
   slots: {
+    zone: { name: "Zone", description: "Zone de la pompe" },
     pump: { name: "Pompe de piscine", description: "Pompe à piloter" },
     slot1_start: { name: "Début", description: "Heure de mise en marche" },
     slot1_end: { name: "Fin", description: "Heure d'arrêt" },
@@ -252,6 +262,9 @@ export function createRecipe(): RecipeDefinition {
     i18n: { fr: FR },
 
     validate(params) {
+      if (!params.zone) {
+        throw new Error("Zone is required");
+      }
       if (!params.pump) {
         throw new Error("Pool pump is required");
       }

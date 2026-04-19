@@ -81,15 +81,27 @@ describe("validate", () => {
   const recipe = createRecipe();
   const { ctx } = buildCtx();
 
+  it("rejects when zone is missing", () => {
+    expect(() =>
+      recipe.validate(
+        { pump: "P1", slot1_start: "10:00", slot1_end: "14:00" },
+        ctx as never,
+      ),
+    ).toThrow(/zone is required/i);
+  });
+
   it("rejects when pump is missing", () => {
     expect(() =>
-      recipe.validate({ slot1_start: "10:00", slot1_end: "14:00" }, ctx as never),
+      recipe.validate(
+        { zone: "Z1", slot1_start: "10:00", slot1_end: "14:00" },
+        ctx as never,
+      ),
     ).toThrow(/pump is required/i);
   });
 
   it("rejects when slot 1 end is missing", () => {
     expect(() =>
-      recipe.validate({ pump: "P1", slot1_start: "10:00" }, ctx as never),
+      recipe.validate({ zone: "Z1", pump: "P1", slot1_start: "10:00" }, ctx as never),
     ).toThrow(/slot 1 start and end are required/i);
   });
 
@@ -97,7 +109,7 @@ describe("validate", () => {
     expect(() =>
       recipe.validate(
         {
-          pump: "P1",
+          zone: "Z1", pump: "P1",
           slot1_start: "10:00",
           slot1_end: "14:00",
           slot2_start: "20:00",
@@ -111,7 +123,7 @@ describe("validate", () => {
     expect(() =>
       recipe.validate(
         {
-          pump: "P1",
+          zone: "Z1", pump: "P1",
           slot1_start: "10:00",
           slot1_end: "14:00",
           slot2_end: "22:00",
@@ -124,7 +136,7 @@ describe("validate", () => {
   it("rejects slot with start == end", () => {
     expect(() =>
       recipe.validate(
-        { pump: "P1", slot1_start: "10:00", slot1_end: "10:00" },
+        { zone: "Z1", pump: "P1", slot1_start: "10:00", slot1_end: "10:00" },
         ctx as never,
       ),
     ).toThrow(/start and end must differ/i);
@@ -133,7 +145,7 @@ describe("validate", () => {
   it("accepts a single valid slot", () => {
     expect(() =>
       recipe.validate(
-        { pump: "P1", slot1_start: "10:00", slot1_end: "14:00" },
+        { zone: "Z1", pump: "P1", slot1_start: "10:00", slot1_end: "14:00" },
         ctx as never,
       ),
     ).not.toThrow();
@@ -143,7 +155,7 @@ describe("validate", () => {
     expect(() =>
       recipe.validate(
         {
-          pump: "P1",
+          zone: "Z1", pump: "P1",
           slot1_start: "10:00",
           slot1_end: "14:00",
           slot2_start: "20:00",
@@ -173,7 +185,7 @@ describe("createInstance", () => {
     const recipe = createRecipe();
     const { ctx, orderCalls, state } = buildCtx();
     const handle = recipe.createInstance(
-      { pump: "P1", slot1_start: "10:00", slot1_end: "14:00" },
+      { zone: "Z1", pump: "P1", slot1_start: "10:00", slot1_end: "14:00" },
       ctx as never,
     );
 
@@ -196,7 +208,7 @@ describe("createInstance", () => {
     const recipe = createRecipe();
     const { ctx, orderCalls } = buildCtx();
     const handle = recipe.createInstance(
-      { pump: "P1", slot1_start: "10:00", slot1_end: "14:00" },
+      { zone: "Z1", pump: "P1", slot1_start: "10:00", slot1_end: "14:00" },
       ctx as never,
     );
 
@@ -221,7 +233,7 @@ describe("createInstance", () => {
     const { ctx, orderCalls } = buildCtx();
     vi.setSystemTime(new Date("2026-04-19T23:57:00"));
     const handle = recipe.createInstance(
-      { pump: "P1", slot1_start: "23:58", slot1_end: "00:02" },
+      { zone: "Z1", pump: "P1", slot1_start: "23:58", slot1_end: "00:02" },
       ctx as never,
     );
 
@@ -240,7 +252,7 @@ describe("createInstance", () => {
     const recipe = createRecipe();
     const { ctx, orderCalls } = buildCtx();
     const handle = recipe.createInstance(
-      { pump: "P1", slot1_start: "10:00", slot1_end: "14:00" },
+      { zone: "Z1", pump: "P1", slot1_start: "10:00", slot1_end: "14:00" },
       ctx as never,
     );
     handle.stop();
@@ -252,7 +264,7 @@ describe("createInstance", () => {
     const recipe = createRecipe();
     const { ctx, orderCalls } = buildCtx();
     const handle = recipe.createInstance(
-      { pump: "P1", slot1_start: "10:00", slot1_end: "14:00" },
+      { zone: "Z1", pump: "P1", slot1_start: "10:00", slot1_end: "14:00" },
       ctx as never,
     );
     // Advance to running state
