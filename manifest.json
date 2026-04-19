@@ -2,7 +2,7 @@
   "id": "pool-pump-schedule",
   "type": "recipe",
   "name": "Pool Pump Schedule",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "description": "Scheduled on/off for a pool pump — up to 3 daily time windows",
   "icon": "Waves",
   "repo": "mchacher/sowel-recipe-pool-pump-schedule",
