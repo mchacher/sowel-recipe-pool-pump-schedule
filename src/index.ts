@@ -391,13 +391,16 @@ function buildSlots(): RecipeSlotDef[] {
       group: "filtration",
     },
 
-    // Slot 1 — required
+    // Slot 1 — only conditionally required: mandatory in schedule mode, optional
+    // in auto mode (a water-temp sensor is set). A static `required: true` would
+    // let the UI block clearing it even in auto mode, so it is marked optional
+    // here and validate() enforces the schedule-mode requirement at save time.
     {
       id: "slot1_start",
       name: "Start",
       description: "Start time",
       type: "time",
-      required: true,
+      required: false,
       group: "slot1",
     },
     {
@@ -405,7 +408,7 @@ function buildSlots(): RecipeSlotDef[] {
       name: "End",
       description: "End time",
       type: "time",
-      required: true,
+      required: false,
       group: "slot1",
     },
 

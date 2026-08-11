@@ -2,7 +2,7 @@
   "id": "pool-pump-schedule",
   "type": "recipe",
   "name": "Pool Pump Schedule",
-  "version": "1.2.0",
+  "version": "1.2.1",
   "description": "Pool pump control: daily schedule windows, an optional water-temperature filtration-time target, and optional solar-surplus running.",
   "icon": "Waves",
   "repo": "mchacher/sowel-recipe-pool-pump-schedule",
