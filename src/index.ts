@@ -9,6 +9,13 @@
  * than the corresponding start time cross midnight naturally —
  * `msUntilTime` schedules each timer independently.
  *
+ * Beyond the edges, the recipe reconciles: at instance start, on every
+ * pump state report, and on a periodic guard, it compares the observed
+ * pump state with what the schedule expects and re-sends the corrective
+ * order when they disagree (issue #1 — a lost OFF once left the pump
+ * running 15 hours). A manual order from the user (UI, button) sets a
+ * dérogation: reconciliation stands down until the next slot edge.
+ *
  * Stopping the instance mid-cycle overrides the schedule: the pump
  * receives an explicit OFF and all timers are cancelled.
  */
@@ -76,8 +83,14 @@ interface RecipeStateStore {
   clear(): void;
 }
 
+interface EquipmentDataBindingValue {
+  alias: string;
+  value: unknown;
+}
+
 interface EquipmentManager {
   getById(id: string): Equipment | null;
+  getDataBindingsWithValues?(id: string): EquipmentDataBindingValue[];
   executeOrder(
     equipmentId: string,
     alias: string,
@@ -98,6 +111,12 @@ interface RecipeContext {
   state: RecipeStateStore;
   log: (message: string, level?: "info" | "warn" | "error") => void;
   helpers: { parseDuration(value: unknown): number };
+  /** Order dispatch with recipe source attribution (newer cores). */
+  dispatchOrder?(
+    equipmentId: string,
+    alias: string,
+    value: unknown,
+  ): Promise<{ success: boolean; error?: string }>;
 }
 
 // ============================================================
@@ -129,9 +148,51 @@ function isValidHHMM(s: unknown): s is string {
   return typeof s === "string" && /^([01]\d|2[0-3]):[0-5]\d$/.test(s);
 }
 
+function minutesOfDay(d: Date): number {
+  return d.getHours() * 60 + d.getMinutes();
+}
+
+function toMinutes(time: string): number {
+  const [h, m] = time.split(":").map(Number);
+  return h * 60 + m;
+}
+
+/** True when `now` falls inside the window; end < start crosses midnight. */
+export function isInsideWindow(now: Date, w: Window): boolean {
+  const t = minutesOfDay(now);
+  const start = toMinutes(w.start);
+  const end = toMinutes(w.end);
+  if (start < end) return t >= start && t < end;
+  return t >= start || t < end;
+}
+
+/** The window containing `now`, or null when the pump should be off. */
+export function activeWindow(now: Date, windows: Window[]): Window | null {
+  return windows.find((w) => isInsideWindow(now, w)) ?? null;
+}
+
+/** What the schedule expects the pump state to be at `now`. */
+export function scheduledState(now: Date, windows: Window[]): "ON" | "OFF" {
+  return activeWindow(now, windows) ? "ON" : "OFF";
+}
+
+/** Normalize a raw binding value to ON/OFF, null when unreadable. */
+export function normalizePumpState(value: unknown): "ON" | "OFF" | null {
+  if (value === "ON" || value === "on" || value === true) return "ON";
+  if (value === "OFF" || value === "off" || value === false) return "OFF";
+  return null;
+}
+
 function windowLabel(w: Window): string {
   return `${w.start}-${w.end}`;
 }
+
+/** Periodic reconciliation guard cadence. */
+const RECONCILE_INTERVAL_MS = 5 * 60_000;
+/** Minimum delay between two corrective orders (avoids fighting a dead device). */
+const CORRECTION_COOLDOWN_MS = 60_000;
+/** Window after an own dispatch during which order events are considered ours. */
+const OWN_ORDER_GRACE_MS = 5_000;
 
 function buildWindows(params: Record<string, unknown>): Window[] {
   const windows: Window[] = [];
@@ -305,10 +366,28 @@ export function createRecipe(): RecipeDefinition {
 
       const startTimers = new Map<number, ReturnType<typeof setTimeout>>();
       const endTimers = new Map<number, ReturnType<typeof setTimeout>>();
+      const unsubs: Array<() => void> = [];
+      let reconcileTimer: ReturnType<typeof setInterval> | null = null;
+      let lastOwnDispatch = 0;
+      let lastCorrection = 0;
+
+      async function sendOrder(value: "ON" | "OFF"): Promise<void> {
+        lastOwnDispatch = Date.now();
+        if (ctx.dispatchOrder) {
+          await ctx.dispatchOrder(pumpId, "state", value);
+        } else {
+          await ctx.equipmentManager.executeOrder(pumpId, "state", value);
+        }
+      }
+
+      function setIfChanged(key: string, value: unknown): void {
+        if (ctx.state.get(key) !== value) ctx.state.set(key, value);
+      }
 
       async function fireOn(w: Window): Promise<void> {
         try {
-          await ctx.equipmentManager.executeOrder(pumpId, "state", "ON");
+          setIfChanged("override", false);
+          await sendOrder("ON");
           ctx.state.set("status", "running");
           ctx.state.set("currentSlot", windowLabel(w));
           ctx.log(`Pompe ${pumpName()} — démarrage créneau ${windowLabel(w)}`);
@@ -320,7 +399,8 @@ export function createRecipe(): RecipeDefinition {
 
       async function fireOff(w: Window): Promise<void> {
         try {
-          await ctx.equipmentManager.executeOrder(pumpId, "state", "OFF");
+          setIfChanged("override", false);
+          await sendOrder("OFF");
           ctx.state.set("status", "idle");
           ctx.state.set("currentSlot", null);
           ctx.log(`Pompe ${pumpName()} — arrêt créneau ${windowLabel(w)}`);
@@ -328,6 +408,53 @@ export function createRecipe(): RecipeDefinition {
           const msg = err instanceof Error ? err.message : String(err);
           ctx.log(`Erreur OFF pompe ${pumpName()}: ${msg}`, "error");
         }
+      }
+
+      /** Observed pump state, null when the core cannot expose it. */
+      function readPumpState(): "ON" | "OFF" | null {
+        const bindings = ctx.equipmentManager.getDataBindingsWithValues?.(pumpId);
+        const binding = bindings?.find((b) => b.alias === "state");
+        return binding ? normalizePumpState(binding.value) : null;
+      }
+
+      function syncStateLabels(now: Date): void {
+        const w = activeWindow(now, windows);
+        if (w) {
+          setIfChanged("status", "running");
+          setIfChanged("currentSlot", windowLabel(w));
+        } else {
+          setIfChanged("status", "idle");
+          setIfChanged("currentSlot", null);
+        }
+      }
+
+      /**
+       * Compare the observed pump state with what the schedule expects and
+       * re-send the corrective order on mismatch. Stands down while a manual
+       * dérogation is active (cleared at the next slot edge).
+       */
+      function reconcile(reason: string): void {
+        if (ctx.state.get("override") === true) return;
+        const actual = readPumpState();
+        if (actual === null) return;
+        const now = new Date();
+        const expected = scheduledState(now, windows);
+        if (actual === expected) {
+          syncStateLabels(now);
+          return;
+        }
+        if (Date.now() - lastCorrection < CORRECTION_COOLDOWN_MS) return;
+        lastCorrection = Date.now();
+        ctx.log(
+          `Réconciliation (${reason}) — pompe ${pumpName()} ${actual} au lieu de ${expected}, ordre correctif envoyé`,
+          "warn",
+        );
+        sendOrder(expected)
+          .then(() => syncStateLabels(new Date()))
+          .catch((err: unknown) => {
+            const msg = err instanceof Error ? err.message : String(err);
+            ctx.log(`Erreur réconciliation pompe ${pumpName()}: ${msg}`, "error");
+          });
       }
 
       function scheduleStart(w: Window): void {
@@ -380,6 +507,40 @@ export function createRecipe(): RecipeDefinition {
       }
       updateNextLabels();
 
+      // ── Reconciliation wiring (issue #1) ──
+      // "override" is deliberately NOT reset here: a manual dérogation
+      // persisted before an engine restart keeps standing until the next edge.
+
+      unsubs.push(
+        ctx.eventBus.onType("equipment.data.changed", (event) => {
+          const ev = event as { equipmentId?: string; alias?: string };
+          if (ev.equipmentId !== pumpId || ev.alias !== "state") return;
+          reconcile("état pompe");
+        }),
+      );
+
+      unsubs.push(
+        ctx.eventBus.onType("equipment.order.executed", (event) => {
+          const ev = event as {
+            equipmentId?: string;
+            orderAlias?: string;
+            source?: { kind?: string };
+          };
+          if (ev.equipmentId !== pumpId || ev.orderAlias !== "state") return;
+          if (ev.source?.kind === "recipe") return;
+          if (Date.now() - lastOwnDispatch < OWN_ORDER_GRACE_MS) return;
+          if (ctx.state.get("override") !== true) {
+            ctx.state.set("override", true);
+            ctx.log(
+              `Ordre manuel détecté sur ${pumpName()} — dérogation jusqu'au prochain créneau`,
+            );
+          }
+        }),
+      );
+
+      reconcileTimer = setInterval(() => reconcile("garde périodique"), RECONCILE_INTERVAL_MS);
+      reconcile("démarrage");
+
       const labels = windows.map(windowLabel).join(", ");
       ctx.log(
         `Recette démarrée — pompe ${pumpName()}, ${windows.length} créneau(x) [${labels}]`,
@@ -391,6 +552,10 @@ export function createRecipe(): RecipeDefinition {
           for (const t of endTimers.values()) clearTimeout(t);
           startTimers.clear();
           endTimers.clear();
+          if (reconcileTimer) clearInterval(reconcileTimer);
+          reconcileTimer = null;
+          for (const unsub of unsubs) unsub();
+          unsubs.length = 0;
 
           const wasRunning = ctx.state.get("status") === "running";
           ctx.state.set("status", "idle");
@@ -400,8 +565,7 @@ export function createRecipe(): RecipeDefinition {
             // Override: pump stays ON without the recipe to drive it, so we
             // shut it down on disable (explicit dérogation requested in
             // spec 082).
-            ctx.equipmentManager
-              .executeOrder(pumpId, "state", "OFF")
+            sendOrder("OFF")
               .catch((err: unknown) => {
                 const msg = err instanceof Error ? err.message : String(err);
                 ctx.log(`Erreur OFF (arrêt recette) ${pumpName()}: ${msg}`, "error");
