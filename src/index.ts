@@ -4,6 +4,16 @@
  * Drives a single pool_pump equipment on a fixed daily schedule. Up to
  * three windows per day; each window has a start time and an end time.
  *
+ * v1.2.0 adds two optional layers on top of the schedule, both inert when
+ * unused so schedule-only installs behave exactly as before:
+ *  - A water-temperature filtration target: a daily run-time goal computed
+ *    linearly from the water temperature (capped, e.g. 12 h at 30 °C), using
+ *    yesterday's average because the reading is only valid while the pump
+ *    runs. It is displayed on the instance and the pump stops once reached.
+ *  - Solar-surplus running (spec 140): while below the target, the recipe
+ *    claims capacity from the arbiter and runs on granted surplus. Absent
+ *    arbiter or production, this is inert and the schedule stands alone.
+ *
  * At each start the recipe fires `executeOrder(pumpId, "state", "ON")`,
  * at each end `executeOrder(pumpId, "state", "OFF")`. End times earlier
  * than the corresponding start time cross midnight naturally —
@@ -14,7 +24,8 @@
  * pump state with what the schedule expects and re-sends the corrective
  * order when they disagree (issue #1 — a lost OFF once left the pump
  * running 15 hours). A manual order from the user (UI, button) sets a
- * dérogation: reconciliation stands down until the next slot edge.
+ * dérogation: reconciliation stands down until the next slot edge, or in
+ * auto mode until the next automatic transition or the 06:00 day rollover.
  *
  * Stopping the instance mid-cycle overrides the schedule: the pump
  * receives an explicit OFF and all timers are cancelled.
@@ -98,6 +109,32 @@ interface EquipmentManager {
   ): Promise<{ success: boolean; error?: string }>;
 }
 
+// Spec 140 capacity-arbiter helpers, mirrored from core (recipes don't import
+// core). Optional at the call site — see the `energy?` helper below.
+interface CapacityClaimReq {
+  equipmentId: string;
+  watts?: number;
+  toleratedImportW?: number;
+  slack?: "none" | "some" | "high";
+  note?: string;
+  onGranted: () => void;
+  onRevoked: (reason: string) => void;
+}
+interface CapacityHandle {
+  id: string;
+  status(): "pending" | "granted" | "denied" | "released";
+  deniedReason?: string;
+  release(): void;
+}
+interface EnergyHelpers {
+  claimCapacity(req: CapacityClaimReq): CapacityHandle;
+  getCapacityState(): {
+    enabled: boolean;
+    availableSurplusW: number | null;
+    grants: Array<{ equipmentId: string; watts: number; sinceIso: string }>;
+  };
+}
+
 interface RecipeContext {
   eventBus: { onType(type: string, handler: (event: unknown) => void): () => void };
   equipmentManager: EquipmentManager;
@@ -110,7 +147,23 @@ interface RecipeContext {
   };
   state: RecipeStateStore;
   log: (message: string, level?: "info" | "warn" | "error") => void;
-  helpers: { parseDuration(value: unknown): number };
+  helpers: {
+    parseDuration(value: unknown): number;
+    // Spec 138, Sowel >= 1.37.0. Off-peak schedule for the HC catch-up.
+    // Absent/unconfigured → no HC awareness (falls back to the daytime floor
+    // and the night safety net).
+    getTariff?(): {
+      configured: boolean;
+      offPeakToday: Array<{ start: string; end: string }>;
+      isOffPeakNow: boolean | null;
+    };
+    // Sunlight, for the daytime bias. Absent → a fixed 08:00-20:00 daytime.
+    getSunlight?(): { sunrise: string | null; sunset: string | null; isDaylight: boolean | null };
+    // Spec 140, Sowel >= 1.39.0. Optional: absent on older cores, and
+    // claimCapacity returns a denied handle when the arbiter is off or the
+    // home has no production. The recipe then runs its schedule unchanged.
+    energy?: EnergyHelpers;
+  };
   /** Order dispatch with recipe source attribution (newer cores). */
   dispatchOrder?(
     equipmentId: string,
@@ -153,6 +206,7 @@ function minutesOfDay(d: Date): number {
 }
 
 function toMinutes(time: string): number {
+  if (typeof time !== "string") return NaN; // defensive: garbled helper output
   const [h, m] = time.split(":").map(Number);
   return h * 60 + m;
 }
@@ -187,8 +241,40 @@ function windowLabel(w: Window): string {
   return `${w.start}-${w.end}`;
 }
 
+/**
+ * Daily filtration target in hours from the water temperature. Linear and
+ * capped: `maxHours` is reached at `refTemp` (default 12 h at 30 °C, i.e.
+ * temp × 0.4), floored at `minHours`. The classic "temperature / 2" rule is
+ * deliberately NOT used — it over-filters (15 h at 30 °C).
+ */
+export function computeTargetHours(
+  tempC: number,
+  opts: { maxHours: number; refTemp: number; minHours: number },
+): number {
+  if (!Number.isFinite(tempC) || opts.refTemp <= 0) return opts.minHours;
+  const raw = (tempC * opts.maxHours) / opts.refTemp;
+  const clamped = Math.min(opts.maxHours, Math.max(opts.minHours, raw));
+  return Math.round(clamped * 10) / 10; // 0.1 h precision
+}
+
+/** Read a numeric water temperature (°C) from a binding value, null if unusable. */
+export function normalizeTemp(value: unknown): number | null {
+  return typeof value === "number" && Number.isFinite(value) ? value : null;
+}
+
+/** Local calendar day "YYYY-MM-DD" (server TZ) for the daily rollover. */
+export function localDay(d: Date): string {
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, "0");
+  const dd = String(d.getDate()).padStart(2, "0");
+  return `${y}-${m}-${dd}`;
+}
+
 /** Periodic reconciliation guard cadence. */
 const RECONCILE_INTERVAL_MS = 5 * 60_000;
+/** Accounting + reconcile cadence for the smart-filtration path (runtime and
+ *  water-temp sampling, target roll-over, surplus reconciliation). */
+const TICK_INTERVAL_MS = 30_000;
 /** Minimum delay between two corrective orders (avoids fighting a dead device). */
 const CORRECTION_COOLDOWN_MS = 60_000;
 /** Window after an own dispatch during which order events are considered ours. */
@@ -228,6 +314,81 @@ function buildSlots(): RecipeSlotDef[] {
       type: "equipment",
       required: true,
       constraints: { equipmentType: "pool_pump" },
+    },
+
+    // Smart filtration (optional). Setting a water-temperature sensor turns on
+    // a daily run-time target, displayed on the instance; the schedule windows
+    // then act as catch-up windows toward it and solar surplus runs count too.
+    {
+      id: "waterTempSensor",
+      name: "Water temperature sensor",
+      description:
+        "Equipment reading the pool water temperature. Set it to enable the daily filtration-time target. The reading is only sampled while the pump runs, so yesterday's average drives today's target.",
+      type: "equipment",
+      required: false,
+      group: "filtration",
+    },
+    {
+      id: "maxFiltrationHours",
+      name: "Max filtration hours",
+      description: "Daily target cap, reached at the reference temperature (default 12 h)",
+      type: "number",
+      required: false,
+      defaultValue: 12,
+      constraints: { min: 1, max: 24 },
+      group: "filtration",
+    },
+    {
+      id: "filtrationRefTemp",
+      name: "Reference temperature",
+      description: "Water temperature (°C) at which the max hours is reached (default 30)",
+      type: "number",
+      required: false,
+      defaultValue: 30,
+      constraints: { min: 10, max: 40 },
+      group: "filtration",
+    },
+    {
+      id: "minFiltrationHours",
+      name: "Min filtration hours",
+      description: "Daily target floor whatever the temperature (default 3 h)",
+      type: "number",
+      required: false,
+      defaultValue: 3,
+      constraints: { min: 0, max: 24 },
+      group: "filtration",
+    },
+    {
+      id: "daytimeMinHours",
+      name: "Guaranteed daytime hours",
+      description:
+        "Minimum hours to run in broad daylight even without solar surplus (may cost peak-tariff energy). Filtration is more effective during the day.",
+      type: "number",
+      required: false,
+      defaultValue: 3,
+      constraints: { min: 0, max: 24 },
+      group: "filtration",
+    },
+    {
+      id: "runOnSurplus",
+      name: "Run on solar surplus",
+      description:
+        "Run the pump on solar surplus during the day via the surplus arbiter (Sowel 1.39+). Inert if the arbiter is off or the home has no production.",
+      type: "boolean",
+      required: false,
+      defaultValue: true,
+      group: "filtration",
+    },
+    {
+      id: "toleratedImportW",
+      name: "Partial-surplus tolerance (W)",
+      description:
+        "Grid import the pump accepts in order to catch a partial surplus (0 = only run on full surplus). Higher means it starts on a smaller surplus.",
+      type: "number",
+      required: false,
+      defaultValue: 300,
+      constraints: { min: 0, max: 3000 },
+      group: "filtration",
     },
 
     // Slot 1 — required
@@ -292,7 +453,8 @@ function buildSlots(): RecipeSlotDef[] {
 
 const FR: RecipeLangPack = {
   name: "Programmation pompe piscine",
-  description: "Plages horaires on/off pour la pompe de piscine — jusqu'à 3 créneaux par jour",
+  description:
+    "Pilotage de pompe de piscine : créneaux horaires quotidiens, cible de temps de filtration selon la température de l'eau (option) et fonctionnement sur surplus solaire (option).",
   slots: {
     zone: { name: "Zone", description: "Zone de la pompe" },
     pump: { name: "Pompe de piscine", description: "Pompe à piloter" },
@@ -302,11 +464,44 @@ const FR: RecipeLangPack = {
     slot2_end: { name: "Fin", description: "Heure d'arrêt" },
     slot3_start: { name: "Début", description: "Heure de mise en marche" },
     slot3_end: { name: "Fin", description: "Heure d'arrêt" },
+    waterTempSensor: {
+      name: "Sonde température eau",
+      description:
+        "Équipement lisant la température de l'eau. Renseignez-le pour activer la cible de temps de filtration. La mesure n'est échantillonnée que pompe en marche, donc c'est la moyenne de la veille qui fixe la cible du jour.",
+    },
+    maxFiltrationHours: {
+      name: "Filtration max (h)",
+      description: "Plafond de la cible quotidienne, atteint à la température de référence (défaut 12 h)",
+    },
+    filtrationRefTemp: {
+      name: "Température de référence",
+      description: "Température de l'eau (°C) à laquelle la filtration max est atteinte (défaut 30)",
+    },
+    minFiltrationHours: {
+      name: "Filtration min (h)",
+      description: "Plancher de la cible quotidienne quelle que soit la température (défaut 3 h)",
+    },
+    daytimeMinHours: {
+      name: "Heures garanties en journée",
+      description:
+        "Minimum d'heures en pleine journée même sans surplus solaire (peut coûter des heures pleines). La filtration est plus efficace le jour.",
+    },
+    runOnSurplus: {
+      name: "Tourner sur surplus solaire",
+      description:
+        "Fait tourner la pompe sur le surplus solaire en journée via l'arbitre de surplus (Sowel 1.39+). Inactif si l'arbitre est éteint ou sans production.",
+    },
+    toleratedImportW: {
+      name: "Tolérance surplus partiel (W)",
+      description:
+        "Import réseau que la pompe accepte pour capter un surplus partiel (0 = seulement sur surplus complet). Plus haut = démarre sur un surplus plus faible.",
+    },
   },
   groups: {
     slot1: "Créneau 1",
     slot2: "Créneau 2",
     slot3: "Créneau 3",
+    filtration: "Filtration intelligente",
   },
 };
 
@@ -318,7 +513,8 @@ export function createRecipe(): RecipeDefinition {
   return {
     id: "pool-pump-schedule",
     name: "Pool Pump Schedule",
-    description: "Scheduled on/off for a pool pump — up to 3 daily time windows",
+    description:
+      "Pool pump control: daily schedule windows, an optional water-temperature filtration-time target, and optional solar-surplus running.",
     slots: buildSlots(),
     i18n: { fr: FR },
 
@@ -330,8 +526,11 @@ export function createRecipe(): RecipeDefinition {
         throw new Error("Pool pump is required");
       }
 
-      // Slot 1 must be complete.
-      if (!params.slot1_start || !params.slot1_end) {
+      // In schedule mode (no water-temp sensor) slot 1 is required; in AUTO
+      // mode (a water sensor is set) windows are optional — the temperature
+      // target drives filtration, so a bare auto config is valid.
+      const autoMode = typeof params.waterTempSensor === "string" && !!params.waterTempSensor;
+      if (!autoMode && (!params.slot1_start || !params.slot1_end)) {
         throw new Error("Slot 1 start and end are required");
       }
 
@@ -355,21 +554,66 @@ export function createRecipe(): RecipeDefinition {
           throw new Error(`Slot ${n} start and end must differ`);
         }
       }
+
+      // Smart filtration: the floor must not exceed the cap.
+      const maxH = Number(params.maxFiltrationHours ?? 12);
+      const minH = Number(params.minFiltrationHours ?? 3);
+      if (Number.isFinite(maxH) && Number.isFinite(minH) && minH > maxH) {
+        throw new Error("Min filtration hours must not exceed max filtration hours");
+      }
     },
 
     createInstance(params, ctx) {
       const pumpId = String(params.pump);
       const windows = buildWindows(params);
 
+      // Smart-filtration params (all optional). A water-temperature sensor
+      // turns on the daily run-time target; runOnSurplus adds arbiter-driven
+      // runs. With neither, this recipe behaves exactly like v1.1.0.
+      const waterTempSensorId =
+        typeof params.waterTempSensor === "string" && params.waterTempSensor
+          ? params.waterTempSensor
+          : null;
+      const hasTarget = waterTempSensorId !== null;
+      const maxHours = Number(params.maxFiltrationHours ?? 12);
+      const refTemp = Number(params.filtrationRefTemp ?? 30);
+      const minHours = Number(params.minFiltrationHours ?? 3);
+      const daytimeMinHours = Number(params.daytimeMinHours ?? 3);
+      const runOnSurplus = params.runOnSurplus !== false; // default on in auto mode
+      const toleratedImportW = Math.max(0, Number(params.toleratedImportW ?? 300));
+      const DAY_START_HOUR = 6; // filtration-day boundary → night falls last (daytime bias)
+      const BOOTSTRAP_TEMP = 24; // day-one estimate with no history and no reading
+
+      const waterTempAlias = ((): string => {
+        if (!waterTempSensorId) return "temperature";
+        const bindings = ctx.equipmentManager.getDataBindingsWithValues?.(waterTempSensorId) ?? [];
+        const byCat = (c: string) =>
+          bindings.find((b) => (b as { category?: string }).category === c)?.alias;
+        return byCat("temperature_water") ?? byCat("temperature") ??
+          bindings.find((b) => b.alias === "temperature")?.alias ?? "temperature";
+      })();
+
       const pumpName = (): string =>
         ctx.equipmentManager.getById(pumpId)?.name ?? pumpId.slice(0, 8);
+
+      const num = (v: unknown, d = 0): number =>
+        typeof v === "number" && Number.isFinite(v) ? v : d;
 
       const startTimers = new Map<number, ReturnType<typeof setTimeout>>();
       const endTimers = new Map<number, ReturnType<typeof setTimeout>>();
       const unsubs: Array<() => void> = [];
-      let reconcileTimer: ReturnType<typeof setInterval> | null = null;
+      let guardTimer: ReturnType<typeof setInterval> | null = null;
+      let accountTimer: ReturnType<typeof setInterval> | null = null;
       let lastOwnDispatch = 0;
       let lastCorrection = 0;
+      let lastAccountAt: number | null = null;
+      let lastAutoDesired: "ON" | "OFF" | null = null; // last auto desired-state, for transition logging
+      let stopped = false;
+
+      // Surplus arbiter (spec 140) state.
+      let claim: CapacityHandle | null = null;
+      let arbiterGranted = false;
+      let tickScheduled = false;
 
       async function sendOrder(value: "ON" | "OFF"): Promise<void> {
         lastOwnDispatch = Date.now();
@@ -380,34 +624,17 @@ export function createRecipe(): RecipeDefinition {
         }
       }
 
+      async function dispatch(value: "ON" | "OFF"): Promise<void> {
+        try {
+          await sendOrder(value);
+        } catch (err: unknown) {
+          const msg = err instanceof Error ? err.message : String(err);
+          ctx.log(`Erreur ordre ${value} pompe ${pumpName()}: ${msg}`, "error");
+        }
+      }
+
       function setIfChanged(key: string, value: unknown): void {
         if (ctx.state.get(key) !== value) ctx.state.set(key, value);
-      }
-
-      async function fireOn(w: Window): Promise<void> {
-        try {
-          setIfChanged("override", false);
-          await sendOrder("ON");
-          ctx.state.set("status", "running");
-          ctx.state.set("currentSlot", windowLabel(w));
-          ctx.log(`Pompe ${pumpName()} — démarrage créneau ${windowLabel(w)}`);
-        } catch (err: unknown) {
-          const msg = err instanceof Error ? err.message : String(err);
-          ctx.log(`Erreur ON pompe ${pumpName()}: ${msg}`, "error");
-        }
-      }
-
-      async function fireOff(w: Window): Promise<void> {
-        try {
-          setIfChanged("override", false);
-          await sendOrder("OFF");
-          ctx.state.set("status", "idle");
-          ctx.state.set("currentSlot", null);
-          ctx.log(`Pompe ${pumpName()} — arrêt créneau ${windowLabel(w)}`);
-        } catch (err: unknown) {
-          const msg = err instanceof Error ? err.message : String(err);
-          ctx.log(`Erreur OFF pompe ${pumpName()}: ${msg}`, "error");
-        }
       }
 
       /** Observed pump state, null when the core cannot expose it. */
@@ -417,54 +644,357 @@ export function createRecipe(): RecipeDefinition {
         return binding ? normalizePumpState(binding.value) : null;
       }
 
-      function syncStateLabels(now: Date): void {
-        const w = activeWindow(now, windows);
-        if (w) {
-          setIfChanged("status", "running");
-          setIfChanged("currentSlot", windowLabel(w));
-        } else {
-          setIfChanged("status", "idle");
-          setIfChanged("currentSlot", null);
+      /** Water temperature (°C), null when unavailable — valid only while running. */
+      function readWaterTemp(): number | null {
+        if (!waterTempSensorId) return null;
+        const bindings = ctx.equipmentManager.getDataBindingsWithValues?.(waterTempSensorId);
+        const b =
+          bindings?.find((x) => x.alias === waterTempAlias) ??
+          bindings?.find((x) => x.alias === "temperature");
+        return b ? normalizeTemp(b.value) : null;
+      }
+
+      // Daylight bounds from the core, with a fixed fallback.
+      const daytimeMin = (): { sr: number; ss: number } => {
+        try {
+          const sun = ctx.helpers.getSunlight?.();
+          const parse = (s: unknown, d: number) => {
+            if (typeof s !== "string") return d;
+            const m = toMinutes(s);
+            return Number.isFinite(m) ? m : d;
+          };
+          return { sr: parse(sun?.sunrise, 8 * 60), ss: parse(sun?.sunset, 20 * 60) };
+        } catch {
+          return { sr: 8 * 60, ss: 20 * 60 }; // a throwing helper must not break control
         }
+      };
+      function isDaytime(now: Date): boolean {
+        const { sr, ss } = daytimeMin();
+        const m = minutesOfDay(now);
+        return m >= sr && m <= ss;
+      }
+      /** Now falls inside a configured off-peak (HC) slot. */
+      function inHcSlot(now: Date): boolean {
+        try {
+          const t = ctx.helpers.getTariff?.();
+          if (!t?.configured || !Array.isArray(t.offPeakToday)) return false;
+          const m = minutesOfDay(now);
+          return t.offPeakToday.some((s) => {
+            const a = toMinutes(s?.start);
+            const b = toMinutes(s?.end);
+            if (!Number.isFinite(a) || !Number.isFinite(b)) return false;
+            return a < b ? m >= a && m < b : m >= a || m < b; // handles midnight-crossing
+          });
+        } catch {
+          return false; // a throwing tariff helper must not break control
+        }
+      }
+      /** Filtration-day key: rolls at DAY_START_HOUR so the pre-dawn night belongs
+       *  to the previous filtration day and is filled LAST (daytime bias). */
+      function filtrationDay(now: Date): string {
+        const d = new Date(now);
+        if (d.getHours() < DAY_START_HOUR) d.setDate(d.getDate() - 1);
+        return localDay(d);
+      }
+      /** Deadline catch-up so the target is ALWAYS met. Outside daylight, run
+       *  once the time left until the 06:00 boundary is only just enough to fit
+       *  the hours still owed. Starting as late as possible means the off-peak
+       *  night hours are used first (via rule 2) and peak-tariff running is the
+       *  minimal remaining tail. */
+      function nightCatchUp(now: Date): boolean {
+        if (isDaytime(now)) return false; // daytime is handled by rules 1-3
+        const targetH = num(ctx.state.get("targetHours"));
+        const remainingH = targetH - num(ctx.state.get("runSecondsToday")) / 3600;
+        if (remainingH <= 0) return false;
+        const m = minutesOfDay(now);
+        const dayStartM = DAY_START_HOUR * 60;
+        const hoursUntilBoundary = (m < dayStartM ? dayStartM - m : dayStartM + 1440 - m) / 60;
+        return remainingH >= hoursUntilBoundary; // no slack left → must run now
+      }
+
+      /** Today's run time has not reached the target (always true without one). */
+      function belowTarget(): boolean {
+        if (!hasTarget) return true;
+        const targetH = ctx.state.get("targetHours");
+        if (typeof targetH !== "number" || targetH <= 0) return true; // no valid gate yet
+        return num(ctx.state.get("runSecondsToday")) < targetH * 3600;
+      }
+      /** Not enough run time has landed in broad daylight yet (effectiveness). */
+      function daytimeBelowFloor(): boolean {
+        return num(ctx.state.get("daytimeSecondsToday")) < daytimeMinHours * 3600;
       }
 
       /**
-       * Compare the observed pump state with what the schedule expects and
-       * re-send the corrective order on mismatch. Stands down while a manual
-       * dérogation is active (cleared at the next slot edge).
+       * Priority ladder. Optional forced windows always win. Then, in target
+       * mode and only while the daily target is unmet: solar surplus (free,
+       * partial ok) → off-peak (afternoon then night) → a guaranteed daytime
+       * floor (may cost peak energy) → the pre-dawn night safety net.
        */
-      function reconcile(reason: string): void {
-        if (ctx.state.get("override") === true) return;
-        const actual = readPumpState();
-        if (actual === null) return;
-        const now = new Date();
-        const expected = scheduledState(now, windows);
-        if (actual === expected) {
-          syncStateLabels(now);
-          return;
+      function desiredState(now: Date): "ON" | "OFF" {
+        if (activeWindow(now, windows) !== null) return "ON"; // optional forced windows
+        if (!hasTarget) return "OFF"; // schedule-only (v1.1.0)
+        if (!belowTarget()) return "OFF"; // daily target reached → stop
+        if (runOnSurplus && arbiterGranted) return "ON"; // 1. solar surplus (free/partial)
+        if (inHcSlot(now)) return "ON"; // 2. off-peak HC (afternoon, then night)
+        if (isDaytime(now) && daytimeBelowFloor()) return "ON"; // 3. daytime effectiveness floor
+        if (nightCatchUp(now)) return "ON"; // 4. deadline catch-up → target always met
+        return "OFF";
+      }
+
+      // Mirrors desiredState's branch order so the decision log names the rule
+      // the ladder actually took.
+      function currentReason(now: Date): string {
+        const w = activeWindow(now, windows);
+        if (w) return windowLabel(w);
+        if (runOnSurplus && arbiterGranted) return "surplus";
+        if (inHcSlot(now)) return "heures creuses";
+        if (isDaytime(now) && daytimeBelowFloor()) return "journée";
+        return "rattrapage nuit";
+      }
+      function syncStateLabels(now: Date, expected: "ON" | "OFF"): void {
+        setIfChanged("status", expected === "ON" ? "running" : "idle");
+        setIfChanged("currentSlot", expected === "ON" ? currentReason(now) : null);
+      }
+
+      /** Compact progress string for the decision logs (audit trail). */
+      function progress(): string {
+        if (!hasTarget) return "";
+        const run = num(ctx.state.get("runSecondsToday")) / 3600;
+        const tgt = num(ctx.state.get("targetHours"));
+        const day = num(ctx.state.get("daytimeSecondsToday")) / 3600;
+        return ` [${run.toFixed(1)}/${tgt.toFixed(1)} h, jour ${day.toFixed(1)}/${daytimeMinHours} h]`;
+      }
+      /** One-line decision log, so a later audit shows WHY the pump moved. */
+      function logLine(expected: "ON" | "OFF", now: Date, trigger: string): string {
+        if (expected === "ON") {
+          return `Pompe ${pumpName()} → ON via ${currentReason(now)} (${trigger})${progress()}`;
         }
-        if (Date.now() - lastCorrection < CORRECTION_COOLDOWN_MS) return;
-        lastCorrection = Date.now();
-        ctx.log(
-          `Réconciliation (${reason}) — pompe ${pumpName()} ${actual} au lieu de ${expected}, ordre correctif envoyé`,
-          "warn",
-        );
-        sendOrder(expected)
-          .then(() => syncStateLabels(new Date()))
-          .catch((err: unknown) => {
-            const msg = err instanceof Error ? err.message : String(err);
-            ctx.log(`Erreur réconciliation pompe ${pumpName()}: ${msg}`, "error");
-          });
+        const why = hasTarget && !belowTarget() ? "cible atteinte" : "aucune heure favorable";
+        return `Pompe ${pumpName()} → OFF, ${why} (${trigger})${progress()}`;
+      }
+
+      /** Publish the filtration-target figures for the instance UI. */
+      function updateTargetDisplay(): void {
+        if (!hasTarget) return;
+        const targetH = num(ctx.state.get("targetHours"));
+        const runH = num(ctx.state.get("runSecondsToday")) / 3600;
+        setIfChanged("runHoursToday", Math.round(runH * 10) / 10);
+        setIfChanged("remainingHours", Math.max(0, Math.round((targetH - runH) * 10) / 10));
+      }
+
+      /** Force the desired state to the device (used at schedule edges — the
+       *  order is re-asserted even when the device already matches). */
+      async function fireEdge(reason: string): Promise<void> {
+        const now = new Date();
+        const expected = desiredState(now);
+        syncStateLabels(now, expected);
+        ctx.log(logLine(expected, now, reason));
+        await dispatch(expected);
+      }
+
+      /** Reconcile the observed state toward the desired one, sending only on
+       *  mismatch. `corrective` = drift/guard (warn + cooldown); otherwise a
+       *  normal transition (info, no cooldown). Stands down under a dérogation. */
+      function reconcile(reason: string, corrective: boolean): void {
+        if (ctx.state.get("override") === true) return;
+        const now = new Date();
+        const expected = desiredState(now);
+        syncStateLabels(now, expected);
+        const actual = readPumpState();
+        if (actual === null || actual === expected) return;
+        if (corrective && hasTarget && expected !== lastAutoDesired) {
+          // The 5-min guard caught an auto transition before the 30 s tick did:
+          // log it as the normal rule-named transition, not a drift correction.
+          lastAutoDesired = expected;
+          ctx.log(logLine(expected, now, reason));
+        } else if (corrective) {
+          if (Date.now() - lastCorrection < CORRECTION_COOLDOWN_MS) return;
+          lastCorrection = Date.now();
+          ctx.log(
+            `Réconciliation (${reason}) — pompe ${pumpName()} ${actual} au lieu de ${expected}, ordre correctif${progress()}`,
+            "warn",
+          );
+        } else {
+          ctx.log(logLine(expected, now, reason));
+        }
+        void dispatch(expected);
+      }
+
+      /** Roll the daily counters over, finalise yesterday's average water
+       *  temperature and compute today's filtration target. */
+      function rolloverIfNeeded(now: Date): void {
+        const today = filtrationDay(now);
+        if (ctx.state.get("day") === today) return;
+        const firstInit = ctx.state.get("day") == null;
+        if (!firstInit && hasTarget) {
+          // Auto-mode backstop: a genuine day boundary lifts any lingering manual
+          // dérogation so it never outlives the filtration day. Auto-only on
+          // purpose — the H-1 latch existed only in bare auto mode (no window
+          // edges to clear it); schedule mode keeps its documented contract of
+          // holding the dérogation until the next configured window edge.
+          if (ctx.state.get("override") === true) ctx.state.set("override", false);
+          const count = num(ctx.state.get("tempCountToday"));
+          if (count > 0) {
+            ctx.state.set(
+              "waterTempYesterday",
+              Math.round((num(ctx.state.get("tempSumToday")) / count) * 10) / 10,
+            );
+          }
+        }
+        if (hasTarget) {
+          const yTemp = ctx.state.get("waterTempYesterday");
+          const known = typeof yTemp === "number";
+          const seed = known ? (yTemp as number) : readWaterTemp() ?? BOOTSTRAP_TEMP;
+          const target = computeTargetHours(seed, { maxHours, refTemp, minHours });
+          ctx.state.set("targetHours", target);
+          ctx.state.set("waterTempUsed", Math.round(seed * 10) / 10);
+          ctx.log(
+            `Cible de filtration du jour : ${target} h (eau ${Math.round(seed * 10) / 10} °C, ${known ? "moyenne de la veille" : "estimation initiale"})`,
+          );
+        }
+        ctx.state.set("day", today);
+        ctx.state.set("runSecondsToday", 0);
+        ctx.state.set("daytimeSecondsToday", 0);
+        ctx.state.set("tempSumToday", 0);
+        ctx.state.set("tempCountToday", 0);
+        lastAutoDesired = null; // re-evaluate the ladder after the daily reset
+      }
+
+      /** Accumulate run time and sample the water temperature while running. */
+      function account(now: Date): void {
+        const nowMs = now.getTime();
+        const running = readPumpState() === "ON";
+        if (lastAccountAt !== null && running) {
+          const dt = (nowMs - lastAccountAt) / 1000;
+          if (dt > 0 && dt < 3600) {
+            ctx.state.set("runSecondsToday", num(ctx.state.get("runSecondsToday")) + dt);
+            if (isDaytime(now)) {
+              ctx.state.set("daytimeSecondsToday", num(ctx.state.get("daytimeSecondsToday")) + dt);
+            }
+          }
+          if (hasTarget) {
+            const t = readWaterTemp();
+            if (t !== null) {
+              ctx.state.set("tempSumToday", num(ctx.state.get("tempSumToday")) + t);
+              ctx.state.set("tempCountToday", num(ctx.state.get("tempCountToday")) + 1);
+            }
+          }
+        }
+        lastAccountAt = nowMs;
+      }
+
+      /** Hold a surplus claim while the pump still needs to run today. */
+      function manageClaim(): void {
+        if (!runOnSurplus || !hasTarget) return;
+        let enabled = false;
+        try {
+          enabled = !!ctx.helpers.energy && ctx.helpers.energy.getCapacityState().enabled;
+        } catch {
+          enabled = false;
+        }
+        const want = enabled && belowTarget() && ctx.state.get("override") !== true;
+        if (want && !claim && ctx.helpers.energy) {
+          try {
+            claim =
+              ctx.helpers.energy.claimCapacity({
+                equipmentId: pumpId,
+                toleratedImportW, // accept a partial surplus (import a little to catch it)
+                slack: "high", // the pump is very sheddable — yields to priority loads
+                note: "pool filtration on surplus",
+                onGranted: () => {
+                  arbiterGranted = true;
+                  ctx.log(`Surplus solaire accordé par l'arbitre${progress()}`);
+                  scheduleTick();
+                },
+                onRevoked: (why: string) => {
+                  arbiterGranted = false;
+                  ctx.log(`Surplus retiré par l'arbitre (${why})${progress()}`);
+                  scheduleTick();
+                },
+              }) ?? null;
+          } catch (err) {
+            ctx.logger.error({ err }, "pool-pump: claimCapacity failed");
+            claim = null;
+          }
+        } else if (!want && claim) {
+          try {
+            claim.release();
+          } catch {
+            /* a broken handle must not break the recipe */
+          }
+          claim = null;
+          arbiterGranted = false;
+        }
+      }
+
+      // Deferred re-check — the arbiter may call onGranted/onRevoked
+      // synchronously from inside claimCapacity(); never re-enter the pass.
+      function scheduleTick(): void {
+        if (tickScheduled || stopped) return;
+        tickScheduled = true;
+        setTimeout(() => {
+          tickScheduled = false;
+          try {
+            if (!stopped) reconcile("surplus", false);
+          } catch (err) {
+            ctx.logger.error({ err }, "pool-pump: surplus tick failed");
+          }
+        }, 0);
+      }
+
+      /** 30 s accounting pass: runtime + temperature sampling, daily roll-over,
+       *  claim upkeep, target display. It never sends an order except to stop
+       *  the pump the moment the daily target is reached — so with no target
+       *  configured it is inert (v1.1.0 control is untouched). */
+      function accountingTick(): void {
+        if (stopped) return;
+        try {
+          const now = new Date();
+          rolloverIfNeeded(now);
+          account(now);
+          manageClaim();
+          updateTargetDisplay();
+          // Auto mode: drive transitions from the 30 s tick so HC / daytime /
+          // night starts and the target-met stop are timely AND logged with the
+          // rule that actually fired (not the 5-min corrective guard). Inert in
+          // schedule-only mode (desiredState only changes at window edges, which
+          // the edge timers already own).
+          if (hasTarget) {
+            const expected = desiredState(now);
+            if (expected !== lastAutoDesired) {
+              lastAutoDesired = expected;
+              // An auto transition is the natural "edge": it lifts a manual
+              // dérogation so the recipe resumes control. Schedule mode clears
+              // `override` at window edges; auto mode has none, so this is the
+              // analog (without it, a manual order latches override forever).
+              if (ctx.state.get("override") === true) {
+                ctx.state.set("override", false);
+                ctx.log(`Dérogation levée (transition auto) sur ${pumpName()}`);
+              }
+              reconcile("cycle", false);
+            }
+          }
+        } catch (err) {
+          ctx.logger.error({ err }, "pool-pump: accounting tick failed");
+        }
       }
 
       function scheduleStart(w: Window): void {
         const delay = msUntilTime(w.start);
         const timer = setTimeout(() => {
-          fireOn(w).catch((err) =>
-            ctx.logger.error({ err, slot: w.start }, "Start fire failed"),
-          );
-          scheduleStart(w); // re-arm for tomorrow
-          updateNextLabels();
+          try {
+            setIfChanged("override", false); // dérogation lifts at the slot edge
+            rolloverIfNeeded(new Date());
+            manageClaim();
+            fireEdge(`début créneau ${windowLabel(w)}`).catch((err) =>
+              ctx.logger.error({ err, slot: w.start }, "Start fire failed"),
+            );
+          } catch (err) {
+            ctx.logger.error({ err, slot: w.start }, "pool-pump: start edge failed");
+          } finally {
+            scheduleStart(w); // re-arm even if the prologue threw
+            updateNextLabels();
+          }
         }, delay);
         startTimers.set(w.index, timer);
       }
@@ -472,11 +1002,18 @@ export function createRecipe(): RecipeDefinition {
       function scheduleEnd(w: Window): void {
         const delay = msUntilTime(w.end);
         const timer = setTimeout(() => {
-          fireOff(w).catch((err) =>
-            ctx.logger.error({ err, slot: w.end }, "End fire failed"),
-          );
-          scheduleEnd(w); // re-arm for tomorrow
-          updateNextLabels();
+          try {
+            setIfChanged("override", false);
+            manageClaim();
+            fireEdge(`fin créneau ${windowLabel(w)}`).catch((err) =>
+              ctx.logger.error({ err, slot: w.end }, "End fire failed"),
+            );
+          } catch (err) {
+            ctx.logger.error({ err, slot: w.end }, "pool-pump: end edge failed");
+          } finally {
+            scheduleEnd(w); // re-arm even if the prologue threw
+            updateNextLabels();
+          }
         }, delay);
         endTimers.set(w.index, timer);
       }
@@ -515,7 +1052,11 @@ export function createRecipe(): RecipeDefinition {
         ctx.eventBus.onType("equipment.data.changed", (event) => {
           const ev = event as { equipmentId?: string; alias?: string };
           if (ev.equipmentId !== pumpId || ev.alias !== "state") return;
-          reconcile("état pompe");
+          try {
+            reconcile("état pompe", true);
+          } catch (err) {
+            ctx.logger.error({ err }, "pool-pump: state-change handler failed");
+          }
         }),
       );
 
@@ -532,30 +1073,57 @@ export function createRecipe(): RecipeDefinition {
           if (ctx.state.get("override") !== true) {
             ctx.state.set("override", true);
             ctx.log(
-              `Ordre manuel détecté sur ${pumpName()} — dérogation jusqu'au prochain créneau`,
+              hasTarget
+                ? `Ordre manuel détecté sur ${pumpName()}. Dérogation jusqu'à la prochaine transition automatique.`
+                : `Ordre manuel détecté sur ${pumpName()}. Dérogation jusqu'au prochain créneau.`,
             );
           }
         }),
       );
 
-      reconcileTimer = setInterval(() => reconcile("garde périodique"), RECONCILE_INTERVAL_MS);
-      reconcile("démarrage");
+      // First pass: compute today's target, then reconcile the observed state.
+      rolloverIfNeeded(new Date());
+      account(new Date());
+      manageClaim();
+      updateTargetDisplay();
+      reconcile("démarrage", true);
+      lastAutoDesired = desiredState(new Date());
+
+      guardTimer = setInterval(() => {
+        try {
+          reconcile("garde périodique", true);
+        } catch (err) {
+          ctx.logger.error({ err }, "pool-pump: guard tick failed");
+        }
+      }, RECONCILE_INTERVAL_MS);
+      accountTimer = setInterval(accountingTick, TICK_INTERVAL_MS);
 
       const labels = windows.map(windowLabel).join(", ");
       ctx.log(
-        `Recette démarrée — pompe ${pumpName()}, ${windows.length} créneau(x) [${labels}]`,
+        hasTarget
+          ? `Recette démarrée (mode auto) — pompe ${pumpName()} : cible eau/${refTemp}°C→${maxHours}h, plancher ${minHours}h, plancher jour ${daytimeMinHours}h` +
+              (runOnSurplus ? `, surplus (tolérance ${toleratedImportW} W)` : "") +
+              (windows.length ? `, ${windows.length} créneau(x) forcé(s) [${labels}]` : "")
+          : `Recette démarrée (planning) — pompe ${pumpName()}, ${windows.length} créneau(x) [${labels}]`,
       );
 
       return {
         stop(): void {
+          stopped = true;
           for (const t of startTimers.values()) clearTimeout(t);
           for (const t of endTimers.values()) clearTimeout(t);
           startTimers.clear();
           endTimers.clear();
-          if (reconcileTimer) clearInterval(reconcileTimer);
-          reconcileTimer = null;
+          if (guardTimer) clearInterval(guardTimer);
+          if (accountTimer) clearInterval(accountTimer);
+          guardTimer = null;
+          accountTimer = null;
           for (const unsub of unsubs) unsub();
           unsubs.length = 0;
+          if (claim) {
+            claim.release();
+            claim = null;
+          }
 
           const wasRunning = ctx.state.get("status") === "running";
           ctx.state.set("status", "idle");
