@@ -823,6 +823,22 @@ export function createRecipe(): RecipeDefinition {
         void dispatch(expected);
       }
 
+      /** (Re)compute today's filtration target. Prefers yesterday's average
+       *  water temperature when available, else the current reading, else the
+       *  bootstrap estimate. */
+      function computeTarget(): void {
+        if (!hasTarget) return;
+        const yTemp = ctx.state.get("waterTempYesterday");
+        const known = typeof yTemp === "number";
+        const seed = known ? (yTemp as number) : readWaterTemp() ?? BOOTSTRAP_TEMP;
+        const target = computeTargetHours(seed, { maxHours, refTemp, minHours });
+        ctx.state.set("targetHours", target);
+        ctx.state.set("waterTempUsed", Math.round(seed * 10) / 10);
+        ctx.log(
+          `Cible de filtration du jour : ${target} h (eau ${Math.round(seed * 10) / 10} °C, ${known ? "moyenne de la veille" : "estimation initiale"})`,
+        );
+      }
+
       /** Roll the daily counters over, finalise yesterday's average water
        *  temperature and compute today's filtration target. */
       function rolloverIfNeeded(now: Date): void {
@@ -844,17 +860,7 @@ export function createRecipe(): RecipeDefinition {
             );
           }
         }
-        if (hasTarget) {
-          const yTemp = ctx.state.get("waterTempYesterday");
-          const known = typeof yTemp === "number";
-          const seed = known ? (yTemp as number) : readWaterTemp() ?? BOOTSTRAP_TEMP;
-          const target = computeTargetHours(seed, { maxHours, refTemp, minHours });
-          ctx.state.set("targetHours", target);
-          ctx.state.set("waterTempUsed", Math.round(seed * 10) / 10);
-          ctx.log(
-            `Cible de filtration du jour : ${target} h (eau ${Math.round(seed * 10) / 10} °C, ${known ? "moyenne de la veille" : "estimation initiale"})`,
-          );
-        }
+        computeTarget();
         ctx.state.set("day", today);
         ctx.state.set("runSecondsToday", 0);
         ctx.state.set("daytimeSecondsToday", 0);
@@ -1086,6 +1092,10 @@ export function createRecipe(): RecipeDefinition {
 
       // First pass: compute today's target, then reconcile the observed state.
       rolloverIfNeeded(new Date());
+      // Auto mode enabled mid-filtration-day: the 06:00 rollover has not run yet,
+      // so seed the target now (prefers yesterday's average when available) rather
+      // than leaving it unset — and showing 0 h — until the next boundary.
+      if (hasTarget && ctx.state.get("targetHours") == null) computeTarget();
       account(new Date());
       manageClaim();
       updateTargetDisplay();
