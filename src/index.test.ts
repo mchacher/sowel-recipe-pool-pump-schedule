@@ -5,6 +5,7 @@ import {
   isInsideWindow,
   scheduledState,
   normalizePumpState,
+  computeTargetHours,
 } from "./index.js";
 
 // ============================================================
@@ -13,13 +14,23 @@ import {
 
 type OrderCall = { equipmentId: string; alias: string; value: unknown };
 
-function buildCtx(opts: { pumpName?: string; initialPumpState?: unknown } = {}) {
+function buildCtx(
+  opts: {
+    pumpName?: string;
+    initialPumpState?: unknown;
+    waterTemp?: number;
+    tariff?: unknown;
+    sunlight?: unknown;
+    energy?: unknown;
+  } = {},
+) {
   const orderCalls: OrderCall[] = [];
   const state = new Map<string, unknown>();
   const logLines: string[] = [];
   const handlers = new Map<string, Array<(event: unknown) => void>>();
   // Well-behaved device by default: its state follows the orders it receives.
   let pumpState: unknown = opts.initialPumpState ?? "OFF";
+  let waterTemp: unknown = opts.waterTemp; // WT1 sensor reading
 
   const recordOrder = (equipmentId: string, alias: string, value: unknown) => {
     orderCalls.push({ equipmentId, alias, value });
@@ -42,7 +53,10 @@ function buildCtx(opts: { pumpName?: string; initialPumpState?: unknown } = {}) 
     },
     equipmentManager: {
       getById: (id: string) => ({ id, name: opts.pumpName ?? "Pompe", type: "pool_pump" }),
-      getDataBindingsWithValues: () => [{ alias: "state", value: pumpState }],
+      getDataBindingsWithValues: (id: string) =>
+        id === "WT1"
+          ? [{ alias: "temperature", value: waterTemp }]
+          : [{ alias: "state", value: pumpState }],
       executeOrder: async (equipmentId: string, alias: string, value: unknown) => {
         recordOrder(equipmentId, alias, value);
         return { success: true };
@@ -72,7 +86,12 @@ function buildCtx(opts: { pumpName?: string; initialPumpState?: unknown } = {}) 
     log: (msg: string) => {
       logLines.push(msg);
     },
-    helpers: { parseDuration: () => 0 },
+    helpers: {
+      parseDuration: () => 0,
+      ...(opts.tariff !== undefined ? { getTariff: () => opts.tariff } : {}),
+      ...(opts.sunlight !== undefined ? { getSunlight: () => opts.sunlight } : {}),
+      ...(opts.energy !== undefined ? { energy: opts.energy } : {}),
+    },
   };
 
   const emit = (type: string, event: unknown) => {
@@ -81,9 +100,51 @@ function buildCtx(opts: { pumpName?: string; initialPumpState?: unknown } = {}) 
   const setPumpState = (v: unknown) => {
     pumpState = v;
   };
+  const setWaterTemp = (v: unknown) => {
+    waterTemp = v;
+  };
   const getPumpState = () => pumpState;
 
-  return { ctx, orderCalls, state, logLines, emit, setPumpState, getPumpState };
+  return { ctx, orderCalls, state, logLines, emit, setPumpState, setWaterTemp, getPumpState };
+}
+
+// Fake capacity arbiter (spec 140). grant()/revoke() drive the recipe's
+// onGranted/onRevoked callbacks, as the real arbiter would.
+function makeArbiter(opts?: { enabled?: boolean; denied?: boolean }) {
+  const enabled = opts?.enabled ?? true;
+  let status: "pending" | "granted" | "denied" | "released" = "pending";
+  let req: { onGranted: () => void; onRevoked: (r: string) => void } | null = null;
+  const handle = {
+    id: "claim-1",
+    status: () => status,
+    deniedReason: opts?.denied ? "not-profiled" : undefined,
+    release: () => {
+      status = "released";
+    },
+  };
+  return {
+    energy: {
+      claimCapacity: (r: { onGranted: () => void; onRevoked: (r: string) => void }) => {
+        req = r;
+        status = opts?.denied ? "denied" : "pending";
+        return handle;
+      },
+      getCapacityState: () => ({ enabled, availableSurplusW: enabled ? 800 : null, grants: [] }),
+    },
+    grant: () => {
+      if (status === "pending") {
+        status = "granted";
+        req?.onGranted();
+      }
+    },
+    revoke: () => {
+      if (status === "granted") {
+        status = "pending";
+        req?.onRevoked("surplus-deficit");
+      }
+    },
+    claimed: () => req !== null && status !== "released",
+  };
 }
 
 // ============================================================
@@ -226,6 +287,16 @@ describe("validate", () => {
         ctx as never,
       ),
     ).not.toThrow();
+  });
+
+  it("auto mode (water sensor set) does not require a fixed window", () => {
+    expect(() =>
+      recipe.validate({ zone: "Z1", pump: "P1", waterTempSensor: "WT1" }, ctx as never),
+    ).not.toThrow();
+  });
+
+  it("schedule mode (no water sensor) still requires slot 1", () => {
+    expect(() => recipe.validate({ zone: "Z1", pump: "P1" }, ctx as never)).toThrow(/slot 1/i);
   });
 
   it("accepts two valid slots", () => {
@@ -469,7 +540,7 @@ describe("reconciliation", () => {
     });
     setPumpState("ON");
     expect(state.get("override")).toBe(true);
-    expect(logLines.some((l) => l.includes("dérogation"))).toBe(true);
+    expect(logLines.some((l) => l.toLowerCase().includes("dérogation"))).toBe(true);
 
     // Reconciliation stands down.
     await vi.advanceTimersByTimeAsync(10 * 60_000);
@@ -535,5 +606,303 @@ describe("reconciliation", () => {
     // Startup reconcile must NOT correct: the user's choice stands.
     expect(orderCalls.length).toBe(0);
     handle.stop();
+  });
+
+  it("schedule mode: a dérogation survives the 06:00 rollover (lifts only at a window edge)", async () => {
+    // The auto-mode 06:00 backstop must NOT bleed into schedule mode, whose
+    // documented contract holds the dérogation until the next configured edge.
+    vi.setSystemTime(new Date("2026-08-06T15:00:00")); // after the 14:00 window end
+    const recipe = createRecipe();
+    const { ctx, state, setPumpState, emit } = buildCtx(); // schedule mode (no water sensor)
+    const handle = recipe.createInstance(params, ctx as never);
+    await vi.advanceTimersByTimeAsync(6_000); // clear the own-order grace
+    emit("equipment.order.executed", {
+      equipmentId: "P1",
+      orderAlias: "state",
+      source: { kind: "manual", userId: "u1" },
+    });
+    setPumpState("ON");
+    expect(state.get("override")).toBe(true);
+    await vi.advanceTimersByTimeAsync(15.5 * 3600_000); // 06:30 next day: crosses 06:00, no window edge
+    expect(state.get("override")).toBe(true); // still held — schedule contract unbroken
+    handle.stop();
+  });
+});
+
+// ============================================================
+// Smart filtration (v1.2.0): water-temp target + solar surplus
+// ============================================================
+
+describe("smart filtration (v1.2.0, auto model)", () => {
+  it("computeTargetHours is linear, capped at maxHours@refTemp, floored at minHours", () => {
+    const o = { maxHours: 12, refTemp: 30, minHours: 3 };
+    expect(computeTargetHours(30, o)).toBe(12); // cap reached at the reference
+    expect(computeTargetHours(20, o)).toBe(8); // 20 * 12/30
+    expect(computeTargetHours(15, o)).toBe(6);
+    expect(computeTargetHours(35, o)).toBe(12); // above the reference → still capped
+    expect(computeTargetHours(5, o)).toBe(3); // 2 floored to 3
+    expect(computeTargetHours(Number.NaN, o)).toBe(3); // invalid → floor
+  });
+
+  describe("instance", () => {
+    beforeEach(() => {
+      vi.useFakeTimers();
+    });
+    afterEach(() => {
+      vi.useRealTimers();
+    });
+
+    // Full daylight 07:00-20:00 and the owner's HC slots.
+    const SUN = { sunrise: "07:00", sunset: "20:00", isDaylight: true };
+    const TARIFF = {
+      configured: true,
+      offPeakToday: [
+        { start: "00:04", end: "05:34" },
+        { start: "14:34", end: "17:04" },
+      ],
+      isOffPeakNow: null,
+    };
+    const AUTO = { zone: "Z1", pump: "P1", waterTempSensor: "WT1" };
+    const onCount = (calls: OrderCall[]) => calls.filter((c) => c.value === "ON").length;
+
+    it("computes and displays a daily target from the current water temp on day one", () => {
+      vi.setSystemTime(new Date("2026-08-06T08:00:00"));
+      const { ctx, state } = buildCtx({ waterTemp: 25, sunlight: SUN, tariff: TARIFF });
+      const handle = createRecipe().createInstance(
+        { ...AUTO, runOnSurplus: false },
+        ctx as never,
+      );
+      expect(state.get("targetHours")).toBe(10); // 25 * 12/30
+      expect(state.get("waterTempUsed")).toBe(25);
+      handle.stop();
+    });
+
+    it("rule 1: solar surplus runs the pump even outside off-peak and daylight", async () => {
+      // 20:30 past sunset, no HC; waterTemp 20 → 8 h target, small enough that the
+      // deadline catch-up has slack and does not fire yet → only surplus can run.
+      vi.setSystemTime(new Date("2026-08-06T20:30:00"));
+      const arb = makeArbiter();
+      const { ctx, orderCalls } = buildCtx({
+        waterTemp: 20,
+        energy: arb.energy,
+        sunlight: SUN,
+        tariff: TARIFF,
+      });
+      const handle = createRecipe().createInstance(
+        { ...AUTO, runOnSurplus: true },
+        ctx as never,
+      );
+      expect(arb.claimed()).toBe(true);
+      await vi.advanceTimersByTimeAsync(1);
+      expect(onCount(orderCalls)).toBe(0); // no rule fires without a grant
+      arb.grant();
+      await vi.advanceTimersByTimeAsync(1);
+      expect(orderCalls).toContainEqual({ equipmentId: "P1", alias: "state", value: "ON" });
+      arb.revoke();
+      await vi.advanceTimersByTimeAsync(1);
+      expect(orderCalls).toContainEqual({ equipmentId: "P1", alias: "state", value: "OFF" });
+      handle.stop();
+    });
+
+    it("rule 2: runs during an off-peak (HC) slot to catch up", () => {
+      // sunset 13:00 so 14:40 is NOT daytime → isolates HC from the daytime floor.
+      vi.setSystemTime(new Date("2026-08-06T14:40:00"));
+      const { ctx, orderCalls } = buildCtx({
+        waterTemp: 25,
+        sunlight: { sunrise: "07:00", sunset: "13:00", isDaylight: true },
+        tariff: TARIFF,
+      });
+      const handle = createRecipe().createInstance(
+        { ...AUTO, runOnSurplus: false },
+        ctx as never,
+      );
+      expect(orderCalls).toContainEqual({ equipmentId: "P1", alias: "state", value: "ON" });
+      handle.stop();
+    });
+
+    it("rule 3: runs in broad daylight for the effectiveness floor", () => {
+      vi.setSystemTime(new Date("2026-08-06T11:00:00")); // daytime, not in an HC slot
+      const { ctx, orderCalls } = buildCtx({ waterTemp: 25, sunlight: SUN, tariff: TARIFF });
+      const handle = createRecipe().createInstance(
+        { ...AUTO, runOnSurplus: false },
+        ctx as never,
+      );
+      expect(orderCalls).toContainEqual({ equipmentId: "P1", alias: "state", value: "ON" });
+      handle.stop();
+    });
+
+    it("rule 4: runs the pre-dawn night safety net so the target is met", () => {
+      vi.setSystemTime(new Date("2026-08-06T05:50:00")); // after night HC, before the 06:00 boundary
+      const { ctx, orderCalls } = buildCtx({ waterTemp: 25, sunlight: SUN, tariff: TARIFF });
+      const handle = createRecipe().createInstance(
+        { ...AUTO, runOnSurplus: false },
+        ctx as never,
+      );
+      expect(orderCalls).toContainEqual({ equipmentId: "P1", alias: "state", value: "ON" });
+      handle.stop();
+    });
+
+    it("stops once the daily target is reached", async () => {
+      vi.setSystemTime(new Date("2026-08-06T11:00:00"));
+      const { ctx, orderCalls } = buildCtx({ waterTemp: 30, sunlight: SUN, tariff: TARIFF });
+      const handle = createRecipe().createInstance(
+        {
+          ...AUTO,
+          runOnSurplus: false,
+          maxFiltrationHours: 1,
+          filtrationRefTemp: 30,
+          minFiltrationHours: 0,
+        },
+        ctx as never,
+      );
+      expect(orderCalls).toContainEqual({ equipmentId: "P1", alias: "state", value: "ON" });
+      await vi.advanceTimersByTimeAsync(65 * 60_000); // > 1 h target → OFF
+      expect(orderCalls.filter((c) => c.value === "OFF").length).toBeGreaterThanOrEqual(1);
+      handle.stop();
+    });
+
+    it("finalises yesterday's average water temp at the 06:00 filtration-day boundary", async () => {
+      vi.setSystemTime(new Date("2026-08-06T04:30:00")); // pre-dawn = previous filtration day
+      const { ctx, state } = buildCtx({ waterTemp: 22, sunlight: SUN, tariff: TARIFF });
+      const handle = createRecipe().createInstance(
+        { ...AUTO, runOnSurplus: false, minFiltrationHours: 0 },
+        ctx as never,
+      );
+      // 04:30 night safety net → pump runs, sampling 22 °C; cross the 06:00 boundary.
+      await vi.advanceTimersByTimeAsync(2 * 3600_000); // to 06:30
+      expect(state.get("waterTempYesterday")).toBe(22);
+      expect(state.get("targetHours")).toBe(8.8); // 22 * 12/30
+      handle.stop();
+    });
+
+    it("no arbiter on the core: HC/daytime/night rules still drive, no crash", () => {
+      vi.setSystemTime(new Date("2026-08-06T11:00:00"));
+      const { ctx, orderCalls } = buildCtx({ waterTemp: 25, sunlight: SUN, tariff: TARIFF }); // no energy
+      const handle = createRecipe().createInstance(
+        { ...AUTO, runOnSurplus: true },
+        ctx as never,
+      );
+      expect(orderCalls).toContainEqual({ equipmentId: "P1", alias: "state", value: "ON" });
+      handle.stop();
+    });
+
+    it("optional fixed windows still force the pump on in auto mode", () => {
+      vi.setSystemTime(new Date("2026-08-06T21:30:00")); // evening, no auto rule active
+      const { ctx, orderCalls } = buildCtx({ waterTemp: 25, sunlight: SUN, tariff: TARIFF });
+      const handle = createRecipe().createInstance(
+        { ...AUTO, runOnSurplus: false, slot1_start: "21:00", slot1_end: "22:00" },
+        ctx as never,
+      );
+      expect(orderCalls).toContainEqual({ equipmentId: "P1", alias: "state", value: "ON" });
+      handle.stop();
+    });
+
+    it("logs its decision with the rule and progress (audit trail)", async () => {
+      vi.setSystemTime(new Date("2026-08-06T20:30:00")); // only surplus can run it (8 h target)
+      const arb = makeArbiter();
+      const { ctx, logLines } = buildCtx({
+        waterTemp: 20,
+        energy: arb.energy,
+        sunlight: SUN,
+        tariff: TARIFF,
+      });
+      const handle = createRecipe().createInstance({ ...AUTO, runOnSurplus: true }, ctx as never);
+      arb.grant();
+      await vi.advanceTimersByTimeAsync(1);
+      expect(logLines.some((l) => l.includes("Surplus solaire accordé"))).toBe(true);
+      expect(
+        logLines.some((l) => l.includes("→ ON via surplus") && l.includes("/8.0 h")),
+      ).toBe(true);
+      handle.stop();
+    });
+
+    it("names the rule for an HC transition driven by the 30 s tick (audit)", async () => {
+      // sunset 13:00 → 14:xx is not daytime, isolating the HC rule; start just before it.
+      vi.setSystemTime(new Date("2026-08-06T14:30:00"));
+      const { ctx, logLines } = buildCtx({
+        waterTemp: 20,
+        sunlight: { sunrise: "07:00", sunset: "13:00", isDaylight: true },
+        tariff: TARIFF,
+      });
+      const handle = createRecipe().createInstance({ ...AUTO, runOnSurplus: false }, ctx as never);
+      await vi.advanceTimersByTimeAsync(6 * 60_000); // cross into the 14:34 HC slot
+      expect(logLines.some((l) => l.includes("→ ON via heures creuses"))).toBe(true);
+      handle.stop();
+    });
+
+    it("degrades safely on garbled tariff/sunlight helper output (no crash)", () => {
+      vi.setSystemTime(new Date("2026-08-06T11:00:00"));
+      const { ctx, orderCalls } = buildCtx({
+        waterTemp: 25,
+        sunlight: { sunrise: 700, sunset: null, isDaylight: null }, // numeric/null → fallback 08:00-20:00
+        tariff: { configured: true, offPeakToday: undefined, isOffPeakNow: null }, // not an array
+      });
+      const handle = createRecipe().createInstance({ ...AUTO, runOnSurplus: false }, ctx as never);
+      expect(orderCalls).toContainEqual({ equipmentId: "P1", alias: "state", value: "ON" }); // daytime floor
+      handle.stop();
+    });
+
+    it("degrades safely when tariff/sunlight helpers THROW (no crash)", () => {
+      vi.setSystemTime(new Date("2026-08-06T11:00:00"));
+      const b = buildCtx({ waterTemp: 25 });
+      (b.ctx.helpers as Record<string, unknown>).getTariff = () => {
+        throw new Error("boom");
+      };
+      (b.ctx.helpers as Record<string, unknown>).getSunlight = () => {
+        throw new Error("boom");
+      };
+      const handle = createRecipe().createInstance({ ...AUTO, runOnSurplus: false }, b.ctx as never);
+      // daytimeMin/inHcSlot catch internally → fallback daytime → floor → ON, no throw.
+      expect(b.orderCalls).toContainEqual({ equipmentId: "P1", alias: "state", value: "ON" });
+      handle.stop();
+    });
+
+    it("bare auto: a manual order latches a dérogation that lifts at the next auto transition", async () => {
+      // sunset 13:00 so 14:30 is OFF (no HC yet, no daylight, no surplus) → no edge until HC.
+      vi.setSystemTime(new Date("2026-08-06T14:30:00"));
+      const { ctx, state, emit, setPumpState } = buildCtx({
+        waterTemp: 25,
+        sunlight: { sunrise: "07:00", sunset: "13:00", isDaylight: true },
+        tariff: TARIFF,
+      });
+      const handle = createRecipe().createInstance({ ...AUTO, runOnSurplus: false }, ctx as never);
+      // Bare auto has NO window edges — a manual order must still be recoverable.
+      emit("equipment.order.executed", {
+        equipmentId: "P1",
+        orderAlias: "state",
+        source: { kind: "manual", userId: "u1" },
+      });
+      setPumpState("ON");
+      expect(state.get("override")).toBe(true);
+      await vi.advanceTimersByTimeAsync(6 * 60_000); // cross into the 14:34 HC slot → auto transition
+      expect(state.get("override")).toBe(false); // dérogation lifted
+      handle.stop();
+    });
+
+    it("bare auto: the 06:00 rollover lifts a lingering dérogation (backstop)", async () => {
+      vi.setSystemTime(new Date("2026-08-06T23:00:00"));
+      const { ctx, state, emit, setPumpState } = buildCtx({
+        waterTemp: 25,
+        sunlight: SUN,
+        tariff: TARIFF,
+      });
+      const handle = createRecipe().createInstance(
+        { ...AUTO, runOnSurplus: false, minFiltrationHours: 0 },
+        ctx as never,
+      );
+      // Startup dispatches ON (nightCatchUp) — step past the own-order grace so
+      // the manual order below is not mistaken for the recipe's own dispatch.
+      await vi.advanceTimersByTimeAsync(6_000);
+      emit("equipment.order.executed", {
+        equipmentId: "P1",
+        orderAlias: "state",
+        source: { kind: "manual", userId: "u1" },
+      });
+      setPumpState("OFF");
+      expect(state.get("override")).toBe(true);
+      await vi.advanceTimersByTimeAsync(7.5 * 3600_000); // past the 06:00 boundary
+      expect(state.get("override")).toBe(false);
+      handle.stop();
+    });
   });
 });
