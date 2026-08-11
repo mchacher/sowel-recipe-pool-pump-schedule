@@ -299,6 +299,15 @@ describe("validate", () => {
     expect(() => recipe.validate({ zone: "Z1", pump: "P1" }, ctx as never)).toThrow(/slot 1/i);
   });
 
+  it("does not mark slot 1 as required at the schema level (UI must allow clearing it in auto mode)", () => {
+    // Slot 1 is only conditionally required (schedule mode). A static
+    // required:true would let the UI block clearing it even with a water sensor
+    // set — validate() enforces the real rule instead.
+    const slots = recipe.slots as Array<{ id: string; required: boolean }>;
+    expect(slots.find((s) => s.id === "slot1_start")?.required).toBe(false);
+    expect(slots.find((s) => s.id === "slot1_end")?.required).toBe(false);
+  });
+
   it("accepts two valid slots", () => {
     expect(() =>
       recipe.validate(
