@@ -686,6 +686,28 @@ describe("smart filtration (v1.2.0, auto model)", () => {
       handle.stop();
     });
 
+    it("auto enabled mid-filtration-day seeds the target immediately (no 0 until 06:00)", () => {
+      // Same filtration day already recorded → rolloverIfNeeded early-returns, so
+      // without the init seed the target would stay unset until the next 06:00.
+      vi.setSystemTime(new Date("2026-08-06T15:00:00"));
+      const { ctx, state } = buildCtx({ waterTemp: 25, sunlight: SUN, tariff: TARIFF });
+      state.set("day", "2026-08-06"); // mid-day switch to auto (day already set)
+      const handle = createRecipe().createInstance({ ...AUTO, runOnSurplus: false }, ctx as never);
+      expect(state.get("targetHours")).toBe(10); // seeded now from the current reading, not 0
+      handle.stop();
+    });
+
+    it("seeds the target from yesterday's average when available (not the current reading)", () => {
+      vi.setSystemTime(new Date("2026-08-06T15:00:00"));
+      const { ctx, state } = buildCtx({ waterTemp: 30, sunlight: SUN, tariff: TARIFF }); // now 30 → would be 12h
+      state.set("day", "2026-08-06");
+      state.set("waterTempYesterday", 20); // yesterday avg 20 → 8h wins
+      const handle = createRecipe().createInstance({ ...AUTO, runOnSurplus: false }, ctx as never);
+      expect(state.get("targetHours")).toBe(8); // 20 * 12/30, yesterday's average preferred
+      expect(state.get("waterTempUsed")).toBe(20);
+      handle.stop();
+    });
+
     it("rule 1: solar surplus runs the pump even outside off-peak and daylight", async () => {
       // 20:30 past sunset, no HC; waterTemp 20 → 8 h target, small enough that the
       // deadline catch-up has slack and does not fire yet → only surplus can run.
