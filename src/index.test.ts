@@ -686,6 +686,18 @@ describe("smart filtration (v1.2.0, auto model)", () => {
       handle.stop();
     });
 
+    it("publishes state.summary with progress + the active rule (recipe card status line)", () => {
+      vi.setSystemTime(new Date("2026-08-06T18:00:00")); // near sunset → daytime floor drives it ON
+      const { ctx, state } = buildCtx({ waterTemp: 25, sunlight: SUN, tariff: TARIFF });
+      const handle = createRecipe().createInstance({ ...AUTO, runOnSurplus: false }, ctx as never);
+      const summary = state.get("summary");
+      expect(typeof summary).toBe("string");
+      expect(summary).toContain("Filtration");
+      expect(summary).toContain("/10 h"); // target 10 h (25 * 12/30)
+      expect(summary).toContain("journée"); // the active rung
+      handle.stop();
+    });
+
     it("auto enabled mid-filtration-day seeds the target immediately (no 0 until 06:00)", () => {
       // Same filtration day already recorded → rolloverIfNeeded early-returns, so
       // without the init seed the target would stay unset until the next 06:00.
