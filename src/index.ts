@@ -701,11 +701,6 @@ export function createRecipe(): RecipeDefinition {
         if (d.getHours() < DAY_START_HOUR) d.setDate(d.getDate() - 1);
         return localDay(d);
       }
-      /** Deadline catch-up so the target is ALWAYS met. Outside daylight, run
-       *  once the time left until the 06:00 boundary is only just enough to fit
-       *  the hours still owed. Starting as late as possible means the off-peak
-       *  night hours are used first (via rule 2) and peak-tariff running is the
-       *  minimal remaining tail. */
       /** Final guarantee: if the remaining target can no longer be met before the
        *  filtration-day boundary, run now. Tariff-agnostic — it lands on off-peak
        *  when the contract has a slot before the boundary (rule 2 fires first),
@@ -727,10 +722,6 @@ export function createRecipe(): RecipeDefinition {
         const targetH = ctx.state.get("targetHours");
         if (typeof targetH !== "number" || targetH <= 0) return true; // no valid gate yet
         return num(ctx.state.get("runSecondsToday")) < targetH * 3600;
-      }
-      /** Not enough run time has landed in broad daylight yet (effectiveness). */
-      function daytimeBelowFloor(): boolean {
-        return num(ctx.state.get("daytimeSecondsToday")) < daytimeMinHours * 3600;
       }
       /** Deferred daytime floor: still guarantees the daytime minimum, but prefers
        *  free surplus and off-peak first — it only forces the pump (peak price)

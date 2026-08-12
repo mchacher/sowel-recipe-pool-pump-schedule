@@ -840,6 +840,28 @@ describe("smart filtration (v1.2.0, auto model)", () => {
       handle.stop();
     });
 
+    it("target below the daytime minimum wins: the pump caps at target, not the floor", async () => {
+      // daytimeMinHours (5) deliberately exceeds the temperature-derived target (2 h).
+      // The target gate is master: the pump stops at 2 h and does NOT run the 5 h floor.
+      vi.setSystemTime(new Date("2026-08-06T17:00:00")); // floor-fire time, target met before sunset
+      const { ctx, orderCalls } = buildCtx({ waterTemp: 30, sunlight: SUN, tariff: TARIFF });
+      const handle = createRecipe().createInstance(
+        {
+          ...AUTO,
+          runOnSurplus: false,
+          maxFiltrationHours: 2,
+          filtrationRefTemp: 30,
+          minFiltrationHours: 0,
+          daytimeMinHours: 5,
+        },
+        ctx as never,
+      );
+      expect(orderCalls).toContainEqual({ equipmentId: "P1", alias: "state", value: "ON" }); // floor fires
+      await vi.advanceTimersByTimeAsync(2 * 3600_000 + 5 * 60_000); // just past the 2 h target
+      expect(orderCalls.filter((c) => c.value === "OFF").length).toBeGreaterThanOrEqual(1); // capped at target
+      handle.stop();
+    });
+
     it("finalises yesterday's average water temp at the 06:00 filtration-day boundary", async () => {
       vi.setSystemTime(new Date("2026-08-06T04:30:00")); // pre-dawn = previous filtration day
       const { ctx, state } = buildCtx({ waterTemp: 22, sunlight: SUN, tariff: TARIFF });
