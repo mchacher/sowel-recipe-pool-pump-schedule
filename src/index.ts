@@ -796,6 +796,29 @@ export function createRecipe(): RecipeDefinition {
         setIfChanged("remainingHours", Math.max(0, Math.round((targetH - runH) * 10) / 10));
       }
 
+      /** Short human-readable status line for the recipe card (the core renders
+       *  `state.summary`): progress toward the daily target and the active rule. */
+      function updateSummary(now: Date): void {
+        if (!hasTarget) {
+          setIfChanged("summary", readPumpState() === "ON" ? "Filtration en cours" : "Filtration à l'arrêt");
+          return;
+        }
+        const targetH = num(ctx.state.get("targetHours"));
+        const runH = num(ctx.state.get("runSecondsToday")) / 3600;
+        const fmt = (h: number): string =>
+          (Number.isInteger(h) ? String(h) : (Math.round(h * 10) / 10).toFixed(1)).replace(".", ",");
+        const prog = `${fmt(Math.round(runH * 10) / 10)}/${fmt(targetH)} h`;
+        if (ctx.state.get("override") === true) {
+          setIfChanged("summary", `Filtration ${prog} · dérogation`);
+        } else if (desiredState(now) === "ON") {
+          setIfChanged("summary", `Filtration ${prog} · ${currentReason(now)}`);
+        } else if (targetH > 0 && runH >= targetH) {
+          setIfChanged("summary", `Filtration ${fmt(targetH)} h · cible atteinte`);
+        } else {
+          setIfChanged("summary", `Filtration ${prog} · en attente`);
+        }
+      }
+
       /** Force the desired state to the device (used at schedule edges — the
        *  order is re-asserted even when the device already matches). */
       async function fireEdge(reason: string): Promise<void> {
@@ -974,6 +997,7 @@ export function createRecipe(): RecipeDefinition {
           account(now);
           manageClaim();
           updateTargetDisplay();
+          updateSummary(now);
           // Auto mode: drive transitions from the 30 s tick so HC / daytime /
           // night starts and the target-met stop are timely AND logged with the
           // rule that actually fired (not the 5-min corrective guard). Inert in
@@ -1110,6 +1134,7 @@ export function createRecipe(): RecipeDefinition {
       account(new Date());
       manageClaim();
       updateTargetDisplay();
+      updateSummary(new Date());
       reconcile("démarrage", true);
       lastAutoDesired = desiredState(new Date());
 
