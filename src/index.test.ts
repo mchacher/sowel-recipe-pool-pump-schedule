@@ -751,14 +751,48 @@ describe("smart filtration (v1.2.0, auto model)", () => {
       handle.stop();
     });
 
-    it("rule 3: runs in broad daylight for the effectiveness floor", () => {
+    it("rule 3: the daytime floor is DEFERRED toward sunset, not run at midday", () => {
+      // At midday with no surplus and no HC, the floor waits (prefers free
+      // surplus / off-peak first) — it must NOT run eagerly.
       vi.setSystemTime(new Date("2026-08-06T11:00:00")); // daytime, not in an HC slot
+      const a = buildCtx({ waterTemp: 25, sunlight: SUN, tariff: TARIFF });
+      const h1 = createRecipe().createInstance({ ...AUTO, runOnSurplus: false }, a.ctx as never);
+      expect(a.orderCalls.some((c) => c.value === "ON")).toBe(false); // deferred
+      h1.stop();
+    });
+
+    it("rule 3: the daytime floor DOES fire near sunset (deficit can't be deferred further)", () => {
+      // SUN sunset 20:00, floor 3 h → at 18:00 only 2 h of daylight remain < 3 h deficit.
+      vi.setSystemTime(new Date("2026-08-06T18:00:00"));
       const { ctx, orderCalls } = buildCtx({ waterTemp: 25, sunlight: SUN, tariff: TARIFF });
+      const handle = createRecipe().createInstance({ ...AUTO, runOnSurplus: false }, ctx as never);
+      expect(orderCalls).toContainEqual({ equipmentId: "P1", alias: "state", value: "ON" });
+      handle.stop();
+    });
+
+    it("deferred floor: morning surplus satisfies the daytime minimum → no peak-price floor later", async () => {
+      // Sunny morning: surplus runs the pump in daylight, accumulating the daytime
+      // minimum for free, so the floor never has to force peak-price running.
+      vi.setSystemTime(new Date("2026-08-06T08:00:00"));
+      const arb = makeArbiter();
+      const { ctx, getPumpState } = buildCtx({
+        waterTemp: 25,
+        energy: arb.energy,
+        sunlight: SUN,
+        tariff: TARIFF,
+      });
       const handle = createRecipe().createInstance(
-        { ...AUTO, runOnSurplus: false },
+        { ...AUTO, runOnSurplus: true, daytimeMinHours: 2 },
         ctx as never,
       );
-      expect(orderCalls).toContainEqual({ equipmentId: "P1", alias: "state", value: "ON" });
+      arb.grant();
+      await vi.advanceTimersByTimeAsync(2.5 * 3600_000); // 2.5 h of free surplus in daylight
+      arb.revoke();
+      await vi.advanceTimersByTimeAsync(60_000);
+      // Daytime minimum (2 h) already covered by surplus → the floor stays down.
+      vi.setSystemTime(new Date("2026-08-06T18:00:00"));
+      await vi.advanceTimersByTimeAsync(30_000);
+      expect(getPumpState()).toBe("OFF"); // no forced peak-price floor
       handle.stop();
     });
 
@@ -773,8 +807,22 @@ describe("smart filtration (v1.2.0, auto model)", () => {
       handle.stop();
     });
 
+    it("generic tariff: a midday-only off-peak contract runs the pump midday (no night assumption)", () => {
+      // Off-peak read from the contract, whenever it falls — here 11:00-16:00.
+      vi.setSystemTime(new Date("2026-08-06T12:00:00"));
+      const middayHc = {
+        configured: true,
+        offPeakToday: [{ start: "11:00", end: "16:00" }],
+        isOffPeakNow: null,
+      };
+      const { ctx, orderCalls } = buildCtx({ waterTemp: 25, sunlight: SUN, tariff: middayHc });
+      const handle = createRecipe().createInstance({ ...AUTO, runOnSurplus: false }, ctx as never);
+      expect(orderCalls).toContainEqual({ equipmentId: "P1", alias: "state", value: "ON" }); // via midday off-peak
+      handle.stop();
+    });
+
     it("stops once the daily target is reached", async () => {
-      vi.setSystemTime(new Date("2026-08-06T11:00:00"));
+      vi.setSystemTime(new Date("2026-08-06T18:00:00")); // near sunset → floor drives it ON
       const { ctx, orderCalls } = buildCtx({ waterTemp: 30, sunlight: SUN, tariff: TARIFF });
       const handle = createRecipe().createInstance(
         {
@@ -792,6 +840,28 @@ describe("smart filtration (v1.2.0, auto model)", () => {
       handle.stop();
     });
 
+    it("target below the daytime minimum wins: the pump caps at target, not the floor", async () => {
+      // daytimeMinHours (5) deliberately exceeds the temperature-derived target (2 h).
+      // The target gate is master: the pump stops at 2 h and does NOT run the 5 h floor.
+      vi.setSystemTime(new Date("2026-08-06T17:00:00")); // floor-fire time, target met before sunset
+      const { ctx, orderCalls } = buildCtx({ waterTemp: 30, sunlight: SUN, tariff: TARIFF });
+      const handle = createRecipe().createInstance(
+        {
+          ...AUTO,
+          runOnSurplus: false,
+          maxFiltrationHours: 2,
+          filtrationRefTemp: 30,
+          minFiltrationHours: 0,
+          daytimeMinHours: 5,
+        },
+        ctx as never,
+      );
+      expect(orderCalls).toContainEqual({ equipmentId: "P1", alias: "state", value: "ON" }); // floor fires
+      await vi.advanceTimersByTimeAsync(2 * 3600_000 + 5 * 60_000); // just past the 2 h target
+      expect(orderCalls.filter((c) => c.value === "OFF").length).toBeGreaterThanOrEqual(1); // capped at target
+      handle.stop();
+    });
+
     it("finalises yesterday's average water temp at the 06:00 filtration-day boundary", async () => {
       vi.setSystemTime(new Date("2026-08-06T04:30:00")); // pre-dawn = previous filtration day
       const { ctx, state } = buildCtx({ waterTemp: 22, sunlight: SUN, tariff: TARIFF });
@@ -806,11 +876,11 @@ describe("smart filtration (v1.2.0, auto model)", () => {
       handle.stop();
     });
 
-    it("no arbiter on the core: HC/daytime/night rules still drive, no crash", () => {
-      vi.setSystemTime(new Date("2026-08-06T11:00:00"));
+    it("no arbiter on the core: off-peak/daytime/deadline rules still drive, no crash", () => {
+      vi.setSystemTime(new Date("2026-08-06T15:00:00")); // inside the 14:34-17:04 off-peak slot
       const { ctx, orderCalls } = buildCtx({ waterTemp: 25, sunlight: SUN, tariff: TARIFF }); // no energy
       const handle = createRecipe().createInstance(
-        { ...AUTO, runOnSurplus: true },
+        { ...AUTO, runOnSurplus: true }, // requested, but no arbiter → falls back to off-peak
         ctx as never,
       );
       expect(orderCalls).toContainEqual({ equipmentId: "P1", alias: "state", value: "ON" });
@@ -862,7 +932,7 @@ describe("smart filtration (v1.2.0, auto model)", () => {
     });
 
     it("degrades safely on garbled tariff/sunlight helper output (no crash)", () => {
-      vi.setSystemTime(new Date("2026-08-06T11:00:00"));
+      vi.setSystemTime(new Date("2026-08-06T19:00:00")); // near the fallback sunset (20:00) → floor due
       const { ctx, orderCalls } = buildCtx({
         waterTemp: 25,
         sunlight: { sunrise: 700, sunset: null, isDaylight: null }, // numeric/null → fallback 08:00-20:00
@@ -874,7 +944,7 @@ describe("smart filtration (v1.2.0, auto model)", () => {
     });
 
     it("degrades safely when tariff/sunlight helpers THROW (no crash)", () => {
-      vi.setSystemTime(new Date("2026-08-06T11:00:00"));
+      vi.setSystemTime(new Date("2026-08-06T19:00:00")); // near the fallback sunset → floor due
       const b = buildCtx({ waterTemp: 25 });
       (b.ctx.helpers as Record<string, unknown>).getTariff = () => {
         throw new Error("boom");
