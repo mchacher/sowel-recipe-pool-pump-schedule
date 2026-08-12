@@ -584,7 +584,9 @@ export function createRecipe(): RecipeDefinition {
       const daytimeMinHours = Number(params.daytimeMinHours ?? 3);
       const runOnSurplus = params.runOnSurplus !== false; // default on in auto mode
       const toleratedImportW = Math.max(0, Number(params.toleratedImportW ?? 300));
-      const DAY_START_HOUR = 6; // filtration-day boundary → night falls last (daytime bias)
+      const DAY_START_HOUR = 6; // filtration-day reset (early morning): the target is set
+      // for the day ahead, so the pre-boundary hours are the last-resort deadline window
+      // and the pump favours surplus/off-peak/daytime first. Independent of tariff timing.
       const BOOTSTRAP_TEMP = 24; // day-one estimate with no history and no reading
 
       const waterTempAlias = ((): string => {
@@ -704,8 +706,12 @@ export function createRecipe(): RecipeDefinition {
        *  the hours still owed. Starting as late as possible means the off-peak
        *  night hours are used first (via rule 2) and peak-tariff running is the
        *  minimal remaining tail. */
-      function nightCatchUp(now: Date): boolean {
-        if (isDaytime(now)) return false; // daytime is handled by rules 1-3
+      /** Final guarantee: if the remaining target can no longer be met before the
+       *  filtration-day boundary, run now. Tariff-agnostic — it lands on off-peak
+       *  when the contract has a slot before the boundary (rule 2 fires first),
+       *  otherwise on peak as a last resort. */
+      function deadlineCatchUp(now: Date): boolean {
+        if (isDaytime(now)) return false; // daytime is covered by rules 1-3
         const targetH = num(ctx.state.get("targetHours"));
         const remainingH = targetH - num(ctx.state.get("runSecondsToday")) / 3600;
         if (remainingH <= 0) return false;
@@ -726,6 +732,20 @@ export function createRecipe(): RecipeDefinition {
       function daytimeBelowFloor(): boolean {
         return num(ctx.state.get("daytimeSecondsToday")) < daytimeMinHours * 3600;
       }
+      /** Deferred daytime floor: still guarantees the daytime minimum, but prefers
+       *  free surplus and off-peak first — it only forces the pump (peak price)
+       *  once the remaining daytime deficit can no longer be met before sunset.
+       *  Keyed on sunset, so it is independent of when the contract's off-peak
+       *  slots fall. Any daytime running (surplus/off-peak/floor) counts toward
+       *  the minimum, so on a sunny day this rarely fires. */
+      function daytimeFloorDue(now: Date): boolean {
+        if (!isDaytime(now)) return false;
+        const deficitH = daytimeMinHours - num(ctx.state.get("daytimeSecondsToday")) / 3600;
+        if (deficitH <= 0) return false;
+        const { ss } = daytimeMin();
+        const hoursUntilSunset = (ss - minutesOfDay(now)) / 60;
+        return deficitH >= hoursUntilSunset; // can't defer past sunset → run now
+      }
 
       /**
        * Priority ladder. Optional forced windows always win. Then, in target
@@ -738,9 +758,9 @@ export function createRecipe(): RecipeDefinition {
         if (!hasTarget) return "OFF"; // schedule-only (v1.1.0)
         if (!belowTarget()) return "OFF"; // daily target reached → stop
         if (runOnSurplus && arbiterGranted) return "ON"; // 1. solar surplus (free/partial)
-        if (inHcSlot(now)) return "ON"; // 2. off-peak HC (afternoon, then night)
-        if (isDaytime(now) && daytimeBelowFloor()) return "ON"; // 3. daytime effectiveness floor
-        if (nightCatchUp(now)) return "ON"; // 4. deadline catch-up → target always met
+        if (inHcSlot(now)) return "ON"; // 2. off-peak — ANY configured slot, whenever the contract places it
+        if (daytimeFloorDue(now)) return "ON"; // 3. daytime minimum, deferred toward sunset (prefers 1-2)
+        if (deadlineCatchUp(now)) return "ON"; // 4. deadline before the day boundary → target always met
         return "OFF";
       }
 
@@ -751,8 +771,8 @@ export function createRecipe(): RecipeDefinition {
         if (w) return windowLabel(w);
         if (runOnSurplus && arbiterGranted) return "surplus";
         if (inHcSlot(now)) return "heures creuses";
-        if (isDaytime(now) && daytimeBelowFloor()) return "journée";
-        return "rattrapage nuit";
+        if (daytimeFloorDue(now)) return "journée";
+        return "rattrapage (échéance)";
       }
       function syncStateLabels(now: Date, expected: "ON" | "OFF"): void {
         setIfChanged("status", expected === "ON" ? "running" : "idle");
