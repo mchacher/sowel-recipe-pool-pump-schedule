@@ -613,6 +613,7 @@ export function createRecipe(): RecipeDefinition {
       let lastCorrection = 0;
       let lastAccountAt: number | null = null;
       let lastAutoDesired: "ON" | "OFF" | null = null; // last auto desired-state, for transition logging
+      let deadlineLatched = false; // once the deadline catch-up engages tonight, hold it (no threshold chatter)
       let stopped = false;
 
       // Surplus arbiter (spec 140) state.
@@ -706,14 +707,27 @@ export function createRecipe(): RecipeDefinition {
        *  when the contract has a slot before the boundary (rule 2 fires first),
        *  otherwise on peak as a last resort. */
       function deadlineCatchUp(now: Date): boolean {
-        if (isDaytime(now)) return false; // daytime is covered by rules 1-3
+        if (isDaytime(now)) {
+          deadlineLatched = false; // a new day: forget last night's latch
+          return false; // daytime is covered by rules 1-3
+        }
         const targetH = num(ctx.state.get("targetHours"));
         const remainingH = targetH - num(ctx.state.get("runSecondsToday")) / 3600;
         if (remainingH <= 0) return false;
+        // Sticky: the instant remainingH meets the time left until the day
+        // boundary, the pump MUST run to hit the target, and running only lowers
+        // remainingH — there is never a reason to switch back OFF tonight. Latching
+        // avoids the knife-edge chatter of a bare `remainingH >= hoursUntilBoundary`
+        // (the two values sit within a tick of each other at the crossing).
+        if (deadlineLatched) return true;
         const m = minutesOfDay(now);
         const dayStartM = DAY_START_HOUR * 60;
         const hoursUntilBoundary = (m < dayStartM ? dayStartM - m : dayStartM + 1440 - m) / 60;
-        return remainingH >= hoursUntilBoundary; // no slack left → must run now
+        if (remainingH >= hoursUntilBoundary) {
+          deadlineLatched = true; // no slack left → run now and hold
+          return true;
+        }
+        return false;
       }
 
       /** Today's run time has not reached the target (always true without one). */
@@ -901,6 +915,7 @@ export function createRecipe(): RecipeDefinition {
         ctx.state.set("tempSumToday", 0);
         ctx.state.set("tempCountToday", 0);
         lastAutoDesired = null; // re-evaluate the ladder after the daily reset
+        deadlineLatched = false; // fresh day, fresh target: drop the deadline latch
       }
 
       /** Accumulate run time and sample the water temperature while running. */
