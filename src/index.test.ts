@@ -819,6 +819,41 @@ describe("smart filtration (v1.2.0, auto model)", () => {
       handle.stop();
     });
 
+    it("rule 4 latches: no ON/OFF chatter at the deadline threshold crossing", async () => {
+      // Regression (prod 2026-08-14): at night the deadline rung sat on the
+      // knife-edge remainingH ≈ hoursUntilBoundary and the raw `>=` flipped
+      // tick-to-tick, toggling the pump ON/OFF every ~30 s. Once engaged, the
+      // rung must LATCH ON until the target is met, so a hair of runtime jitter
+      // that nudges remainingH back under the boundary no longer flips it OFF.
+      vi.setSystemTime(new Date("2026-08-14T23:12:00")); // night, past sunset, no HC slot
+      const { ctx, state, orderCalls, getPumpState } = buildCtx({
+        waterTemp: 25,
+        sunlight: SUN,
+        tariff: TARIFF,
+      });
+      // Seed the crossing directly: target 11 h, 4.2 h done → remaining 6.8 h,
+      // and hoursUntilBoundary at 23:12 is exactly (06:00 − 23:12) = 6.8 h.
+      state.set("day", "2026-08-14"); // same filtration day → no target recompute
+      state.set("targetHours", 11);
+      state.set("runSecondsToday", 4.2 * 3600);
+      state.set("daytimeSecondsToday", 3 * 3600); // daytime floor already satisfied
+      const handle = createRecipe().createInstance(
+        { ...AUTO, runOnSurplus: false },
+        ctx as never,
+      );
+      // The deadline engages: the pump is commanded ON.
+      expect(orderCalls).toContainEqual({ equipmentId: "P1", alias: "state", value: "ON" });
+      // Model the float/measurement jitter that flipped the raw threshold on
+      // prod: bump runtime a few seconds so remainingH dips just under the
+      // (now smaller) boundary. Pre-fix this makes the next tick compute OFF.
+      state.set("runSecondsToday", 4.21 * 3600 + 40);
+      await vi.advanceTimersByTimeAsync(3 * 30_000); // a few accounting ticks
+      // Latched: it never turns the pump back OFF while still below target.
+      expect(orderCalls.filter((c) => c.value === "OFF")).toHaveLength(0);
+      expect(getPumpState()).toBe("ON");
+      handle.stop();
+    });
+
     it("generic tariff: a midday-only off-peak contract runs the pump midday (no night assumption)", () => {
       // Off-peak read from the contract, whenever it falls — here 11:00-16:00.
       vi.setSystemTime(new Date("2026-08-06T12:00:00"));
