@@ -854,6 +854,36 @@ describe("smart filtration (v1.2.0, auto model)", () => {
       handle.stop();
     });
 
+    it("rule 3 latches: no ON/OFF chatter at the daytime-floor sunset crossing", async () => {
+      // Regression (prod 2026-08-15, ~20:24): the DEFERRED daytime floor has the
+      // same knife-edge as rule 4 — deficitH ≈ hoursUntilSunset near sunset — and
+      // the bare `>=` chattered ON/OFF every 30 s. Once engaged before sunset it
+      // must LATCH ON until the daytime minimum is met.
+      vi.setSystemTime(new Date("2026-08-15T20:24:00")); // before sunset, not in an HC slot
+      const nearSunset = { sunrise: "07:00", sunset: "20:48", isDaylight: true };
+      const { ctx, state, orderCalls, getPumpState } = buildCtx({
+        waterTemp: 25,
+        sunlight: nearSunset,
+        tariff: TARIFF,
+      });
+      // Crossing: deficit 0.4 h (6 − 5.6) equals hoursUntilSunset (20:48 − 20:24).
+      state.set("day", "2026-08-15");
+      state.set("targetHours", 11); // still below the daily target → target gate open
+      state.set("runSecondsToday", 5.6 * 3600);
+      state.set("daytimeSecondsToday", 5.6 * 3600);
+      const handle = createRecipe().createInstance(
+        { ...AUTO, runOnSurplus: false, daytimeMinHours: 6 },
+        ctx as never,
+      );
+      expect(orderCalls).toContainEqual({ equipmentId: "P1", alias: "state", value: "ON" });
+      // Jitter nudges the deficit just under hoursUntilSunset → pre-fix OFF.
+      state.set("daytimeSecondsToday", 5.61 * 3600 + 40);
+      await vi.advanceTimersByTimeAsync(3 * 30_000);
+      expect(orderCalls.filter((c) => c.value === "OFF")).toHaveLength(0);
+      expect(getPumpState()).toBe("ON");
+      handle.stop();
+    });
+
     it("generic tariff: a midday-only off-peak contract runs the pump midday (no night assumption)", () => {
       // Off-peak read from the contract, whenever it falls — here 11:00-16:00.
       vi.setSystemTime(new Date("2026-08-06T12:00:00"));

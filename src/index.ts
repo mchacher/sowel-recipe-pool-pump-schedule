@@ -614,6 +614,7 @@ export function createRecipe(): RecipeDefinition {
       let lastAccountAt: number | null = null;
       let lastAutoDesired: "ON" | "OFF" | null = null; // last auto desired-state, for transition logging
       let deadlineLatched = false; // once the deadline catch-up engages tonight, hold it (no threshold chatter)
+      let daytimeFloorLatched = false; // same, for the deferred daytime floor at its sunset crossing
       let stopped = false;
 
       // Surplus arbiter (spec 140) state.
@@ -744,12 +745,28 @@ export function createRecipe(): RecipeDefinition {
        *  slots fall. Any daytime running (surplus/off-peak/floor) counts toward
        *  the minimum, so on a sunny day this rarely fires. */
       function daytimeFloorDue(now: Date): boolean {
-        if (!isDaytime(now)) return false;
+        if (!isDaytime(now)) {
+          daytimeFloorLatched = false; // sun down: the floor no longer applies
+          return false;
+        }
         const deficitH = daytimeMinHours - num(ctx.state.get("daytimeSecondsToday")) / 3600;
-        if (deficitH <= 0) return false;
+        if (deficitH <= 0) {
+          daytimeFloorLatched = false; // minimum met → drop the latch
+          return false;
+        }
+        // Sticky, exactly like the night deadline: once the floor engages (the
+        // deficit can no longer be met before sunset) there is no slack left to
+        // defer, and running only shrinks the deficit — never a reason to switch
+        // back OFF before sunset. Latching avoids the knife-edge chatter of a bare
+        // `deficitH >= hoursUntilSunset` right at the crossing.
+        if (daytimeFloorLatched) return true;
         const { ss } = daytimeMin();
         const hoursUntilSunset = (ss - minutesOfDay(now)) / 60;
-        return deficitH >= hoursUntilSunset; // can't defer past sunset → run now
+        if (deficitH >= hoursUntilSunset) {
+          daytimeFloorLatched = true; // can't defer past sunset → run now and hold
+          return true;
+        }
+        return false;
       }
 
       /**
@@ -916,6 +933,7 @@ export function createRecipe(): RecipeDefinition {
         ctx.state.set("tempCountToday", 0);
         lastAutoDesired = null; // re-evaluate the ladder after the daily reset
         deadlineLatched = false; // fresh day, fresh target: drop the deadline latch
+        daytimeFloorLatched = false; // and the daytime-floor latch
       }
 
       /** Accumulate run time and sample the water temperature while running. */
