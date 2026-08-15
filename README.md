@@ -62,14 +62,15 @@ with the rule that fired, for audit.
 Without an arbiter, tariff, or sunlight helper the corresponding rungs are
 skipped and the recipe still runs on schedule/target — nothing throws.
 
-### Night deadline latch (v1.4.1)
+### Deferred-rung latches (v1.4.1, v1.4.2)
 
-Once the night deadline catch-up engages, it **holds ON** until the target is
-met. It used to compare the remaining target against the time left before the
-06:00 boundary with a bare threshold, which chattered ON/OFF at the crossing
-when the two values sat within a tick of each other. Latching removes the
-chatter; the target gate still stops the pump as soon as the day's target is
-reached.
+The two deferred rungs — the **daytime floor** (rung 3) and the **night deadline
+catch-up** (rung 5) — each fire when a remaining need can no longer be met before
+a deadline (sunset, resp. the 06:00 boundary). Both used a bare `>=` threshold,
+which chattered ON/OFF every ~30 s at the crossing, when the two sides sat within
+a tick of each other. Each rung now **latches ON** once engaged and holds until
+its need is met (the daytime minimum, resp. the daily target) or its window ends
+(sunset / a new day). v1.4.1 fixed the night rung; v1.4.2 the daytime floor.
 
 ## Behaviour on stop
 
