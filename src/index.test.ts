@@ -1382,7 +1382,6 @@ describe("surplus heating (v1.5.0)", () => {
     heater: "HP1",
     heatingTargetTemp: 28,
     heaterIdleSetpoint: 10,
-    heaterToleratedImportW: 0,
   };
   const T2030 = new Date("2026-08-06T20:30:00");
 
