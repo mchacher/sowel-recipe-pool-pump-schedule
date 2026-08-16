@@ -52,17 +52,29 @@ function buildCtx(
       },
     },
     equipmentManager: {
-      getById: (id: string) => ({ id, name: opts.pumpName ?? "Pompe", type: "pool_pump" }),
+      getById: (id: string) => ({
+        id,
+        name: opts.pumpName ?? "Pompe",
+        type: "pool_pump",
+      }),
       getDataBindingsWithValues: (id: string) =>
         id === "WT1"
           ? [{ alias: "temperature", value: waterTemp }]
           : [{ alias: "state", value: pumpState }],
-      executeOrder: async (equipmentId: string, alias: string, value: unknown) => {
+      executeOrder: async (
+        equipmentId: string,
+        alias: string,
+        value: unknown,
+      ) => {
         recordOrder(equipmentId, alias, value);
         return { success: true };
       },
     },
-    dispatchOrder: async (equipmentId: string, alias: string, value: unknown) => {
+    dispatchOrder: async (
+      equipmentId: string,
+      alias: string,
+      value: unknown,
+    ) => {
       recordOrder(equipmentId, alias, value);
       return { success: true };
     },
@@ -89,7 +101,9 @@ function buildCtx(
     helpers: {
       parseDuration: () => 0,
       ...(opts.tariff !== undefined ? { getTariff: () => opts.tariff } : {}),
-      ...(opts.sunlight !== undefined ? { getSunlight: () => opts.sunlight } : {}),
+      ...(opts.sunlight !== undefined
+        ? { getSunlight: () => opts.sunlight }
+        : {}),
       ...(opts.energy !== undefined ? { energy: opts.energy } : {}),
     },
   };
@@ -105,7 +119,16 @@ function buildCtx(
   };
   const getPumpState = () => pumpState;
 
-  return { ctx, orderCalls, state, logLines, emit, setPumpState, setWaterTemp, getPumpState };
+  return {
+    ctx,
+    orderCalls,
+    state,
+    logLines,
+    emit,
+    setPumpState,
+    setWaterTemp,
+    getPumpState,
+  };
 }
 
 // Fake capacity arbiter (spec 140). grant()/revoke() drive the recipe's
@@ -113,7 +136,8 @@ function buildCtx(
 function makeArbiter(opts?: { enabled?: boolean; denied?: boolean }) {
   const enabled = opts?.enabled ?? true;
   let status: "pending" | "granted" | "denied" | "released" = "pending";
-  let req: { onGranted: () => void; onRevoked: (r: string) => void } | null = null;
+  let req: { onGranted: () => void; onRevoked: (r: string) => void } | null =
+    null;
   const handle = {
     id: "claim-1",
     status: () => status,
@@ -124,12 +148,19 @@ function makeArbiter(opts?: { enabled?: boolean; denied?: boolean }) {
   };
   return {
     energy: {
-      claimCapacity: (r: { onGranted: () => void; onRevoked: (r: string) => void }) => {
+      claimCapacity: (r: {
+        onGranted: () => void;
+        onRevoked: (r: string) => void;
+      }) => {
         req = r;
         status = opts?.denied ? "denied" : "pending";
         return handle;
       },
-      getCapacityState: () => ({ enabled, availableSurplusW: enabled ? 800 : null, grants: [] }),
+      getCapacityState: () => ({
+        enabled,
+        availableSurplusW: enabled ? 800 : null,
+        grants: [],
+      }),
     },
     grant: () => {
       if (status === "pending") {
@@ -194,7 +225,9 @@ describe("isInsideWindow / scheduledState", () => {
     const windows = [day, night];
     expect(scheduledState(new Date("2026-04-19T12:00:00"), windows)).toBe("ON");
     expect(scheduledState(new Date("2026-04-19T03:00:00"), windows)).toBe("ON");
-    expect(scheduledState(new Date("2026-04-19T06:00:00"), windows)).toBe("OFF");
+    expect(scheduledState(new Date("2026-04-19T06:00:00"), windows)).toBe(
+      "OFF",
+    );
   });
 });
 
@@ -239,7 +272,10 @@ describe("validate", () => {
 
   it("rejects when slot 1 end is missing", () => {
     expect(() =>
-      recipe.validate({ zone: "Z1", pump: "P1", slot1_start: "10:00" }, ctx as never),
+      recipe.validate(
+        { zone: "Z1", pump: "P1", slot1_start: "10:00" },
+        ctx as never,
+      ),
     ).toThrow(/slot 1 start and end are required/i);
   });
 
@@ -247,7 +283,8 @@ describe("validate", () => {
     expect(() =>
       recipe.validate(
         {
-          zone: "Z1", pump: "P1",
+          zone: "Z1",
+          pump: "P1",
           slot1_start: "10:00",
           slot1_end: "14:00",
           slot2_start: "20:00",
@@ -261,7 +298,8 @@ describe("validate", () => {
     expect(() =>
       recipe.validate(
         {
-          zone: "Z1", pump: "P1",
+          zone: "Z1",
+          pump: "P1",
           slot1_start: "10:00",
           slot1_end: "14:00",
           slot2_end: "22:00",
@@ -291,12 +329,17 @@ describe("validate", () => {
 
   it("auto mode (water sensor set) does not require a fixed window", () => {
     expect(() =>
-      recipe.validate({ zone: "Z1", pump: "P1", waterTempSensor: "WT1" }, ctx as never),
+      recipe.validate(
+        { zone: "Z1", pump: "P1", waterTempSensor: "WT1" },
+        ctx as never,
+      ),
     ).not.toThrow();
   });
 
   it("schedule mode (no water sensor) still requires slot 1", () => {
-    expect(() => recipe.validate({ zone: "Z1", pump: "P1" }, ctx as never)).toThrow(/slot 1/i);
+    expect(() =>
+      recipe.validate({ zone: "Z1", pump: "P1" }, ctx as never),
+    ).toThrow(/slot 1/i);
   });
 
   it("does not mark slot 1 as required at the schema level (UI must allow clearing it in auto mode)", () => {
@@ -312,7 +355,8 @@ describe("validate", () => {
     expect(() =>
       recipe.validate(
         {
-          zone: "Z1", pump: "P1",
+          zone: "Z1",
+          pump: "P1",
           slot1_start: "10:00",
           slot1_end: "14:00",
           slot2_start: "20:00",
@@ -348,13 +392,21 @@ describe("createInstance", () => {
 
     // Jump to 10:00 → ON fires
     await vi.advanceTimersByTimeAsync(2 * 3600_000);
-    expect(orderCalls).toContainEqual({ equipmentId: "P1", alias: "state", value: "ON" });
+    expect(orderCalls).toContainEqual({
+      equipmentId: "P1",
+      alias: "state",
+      value: "ON",
+    });
     expect(state.get("status")).toBe("running");
     expect(state.get("currentSlot")).toBe("10:00-14:00");
 
     // Jump to 14:00 → OFF fires
     await vi.advanceTimersByTimeAsync(4 * 3600_000);
-    expect(orderCalls).toContainEqual({ equipmentId: "P1", alias: "state", value: "OFF" });
+    expect(orderCalls).toContainEqual({
+      equipmentId: "P1",
+      alias: "state",
+      value: "OFF",
+    });
     expect(state.get("status")).toBe("idle");
     expect(state.get("currentSlot")).toBe(null);
 
@@ -399,11 +451,19 @@ describe("createInstance", () => {
 
     // +1 min → ON (day 1 at 23:58)
     await vi.advanceTimersByTimeAsync(60_000);
-    expect(orderCalls).toContainEqual({ equipmentId: "P1", alias: "state", value: "ON" });
+    expect(orderCalls).toContainEqual({
+      equipmentId: "P1",
+      alias: "state",
+      value: "ON",
+    });
 
     // +4 min more → 00:02 → OFF
     await vi.advanceTimersByTimeAsync(4 * 60_000);
-    expect(orderCalls).toContainEqual({ equipmentId: "P1", alias: "state", value: "OFF" });
+    expect(orderCalls).toContainEqual({
+      equipmentId: "P1",
+      alias: "state",
+      value: "OFF",
+    });
 
     handle.stop();
   });
@@ -429,7 +489,11 @@ describe("createInstance", () => {
     );
     // Advance to running state
     await vi.advanceTimersByTimeAsync(2 * 3600_000);
-    expect(orderCalls).toContainEqual({ equipmentId: "P1", alias: "state", value: "ON" });
+    expect(orderCalls).toContainEqual({
+      equipmentId: "P1",
+      alias: "state",
+      value: "ON",
+    });
 
     // Stop mid-cycle → OFF must be issued
     handle.stop();
@@ -454,15 +518,26 @@ describe("reconciliation", () => {
     vi.useRealTimers();
   });
 
-  const params = { zone: "Z1", pump: "P1", slot1_start: "10:00", slot1_end: "14:00" };
+  const params = {
+    zone: "Z1",
+    pump: "P1",
+    slot1_start: "10:00",
+    slot1_end: "14:00",
+  };
 
   it("corrects a pump found ON outside any window at instance start (incident case)", async () => {
     const recipe = createRecipe();
     const { ctx, orderCalls, logLines } = buildCtx({ initialPumpState: "ON" });
     const handle = recipe.createInstance(params, ctx as never);
 
-    expect(orderCalls).toContainEqual({ equipmentId: "P1", alias: "state", value: "OFF" });
-    expect(logLines.some((l) => l.includes("Réconciliation (démarrage)"))).toBe(true);
+    expect(orderCalls).toContainEqual({
+      equipmentId: "P1",
+      alias: "state",
+      value: "OFF",
+    });
+    expect(logLines.some((l) => l.includes("Réconciliation (démarrage)"))).toBe(
+      true,
+    );
     handle.stop();
   });
 
@@ -472,7 +547,11 @@ describe("reconciliation", () => {
     const { ctx, orderCalls, state } = buildCtx({ initialPumpState: "OFF" });
     const handle = recipe.createInstance(params, ctx as never);
 
-    expect(orderCalls).toContainEqual({ equipmentId: "P1", alias: "state", value: "ON" });
+    expect(orderCalls).toContainEqual({
+      equipmentId: "P1",
+      alias: "state",
+      value: "ON",
+    });
     await vi.advanceTimersByTimeAsync(0);
     expect(state.get("status")).toBe("running");
     expect(state.get("currentSlot")).toBe("10:00-14:00");
@@ -487,7 +566,11 @@ describe("reconciliation", () => {
 
     setPumpState("ON"); // drift without any order event
     await vi.advanceTimersByTimeAsync(5 * 60_000);
-    expect(orderCalls).toContainEqual({ equipmentId: "P1", alias: "state", value: "OFF" });
+    expect(orderCalls).toContainEqual({
+      equipmentId: "P1",
+      alias: "state",
+      value: "OFF",
+    });
     handle.stop();
   });
 
@@ -498,7 +581,11 @@ describe("reconciliation", () => {
 
     setPumpState("ON");
     emit("equipment.data.changed", { equipmentId: "P1", alias: "state" });
-    expect(orderCalls).toContainEqual({ equipmentId: "P1", alias: "state", value: "OFF" });
+    expect(orderCalls).toContainEqual({
+      equipmentId: "P1",
+      alias: "state",
+      value: "OFF",
+    });
     handle.stop();
   });
 
@@ -549,7 +636,9 @@ describe("reconciliation", () => {
     });
     setPumpState("ON");
     expect(state.get("override")).toBe(true);
-    expect(logLines.some((l) => l.toLowerCase().includes("dérogation"))).toBe(true);
+    expect(logLines.some((l) => l.toLowerCase().includes("dérogation"))).toBe(
+      true,
+    );
 
     // Reconciliation stands down.
     await vi.advanceTimersByTimeAsync(10 * 60_000);
@@ -558,7 +647,11 @@ describe("reconciliation", () => {
     // Next edge (10:00 start) clears the dérogation and drives the pump again.
     await vi.advanceTimersByTimeAsync(110 * 60_000);
     expect(state.get("override")).toBe(false);
-    expect(orderCalls).toContainEqual({ equipmentId: "P1", alias: "state", value: "ON" });
+    expect(orderCalls).toContainEqual({
+      equipmentId: "P1",
+      alias: "state",
+      value: "ON",
+    });
 
     // Drift after the edge is corrected again.
     setPumpState("OFF");
@@ -582,7 +675,11 @@ describe("reconciliation", () => {
 
     setPumpState("ON");
     await vi.advanceTimersByTimeAsync(5 * 60_000);
-    expect(orderCalls).toContainEqual({ equipmentId: "P1", alias: "state", value: "OFF" });
+    expect(orderCalls).toContainEqual({
+      equipmentId: "P1",
+      alias: "state",
+      value: "OFF",
+    });
     handle.stop();
   });
 
@@ -595,19 +692,27 @@ describe("reconciliation", () => {
     await vi.advanceTimersByTimeAsync(2 * 3600_000);
 
     // A sourceless echo of that order arrives within the grace window.
-    emit("equipment.order.executed", { equipmentId: "P1", orderAlias: "state" });
+    emit("equipment.order.executed", {
+      equipmentId: "P1",
+      orderAlias: "state",
+    });
     expect(state.get("override")).not.toBe(true);
 
     // A sourceless order long after the grace window is treated as manual.
     await vi.advanceTimersByTimeAsync(6_000);
-    emit("equipment.order.executed", { equipmentId: "P1", orderAlias: "state" });
+    emit("equipment.order.executed", {
+      equipmentId: "P1",
+      orderAlias: "state",
+    });
     expect(state.get("override")).toBe(true);
     handle.stop();
   });
 
   it("persisted dérogation survives a restart and stands down reconciliation", async () => {
     const recipe = createRecipe();
-    const { ctx, orderCalls, state, setPumpState } = buildCtx({ initialPumpState: "ON" });
+    const { ctx, orderCalls, state, setPumpState } = buildCtx({
+      initialPumpState: "ON",
+    });
     state.set("override", true); // persisted from a previous run
     setPumpState("ON");
     const handle = recipe.createInstance(params, ctx as never);
@@ -672,11 +777,16 @@ describe("smart filtration (v1.2.0, auto model)", () => {
       isOffPeakNow: null,
     };
     const AUTO = { zone: "Z1", pump: "P1", waterTempSensor: "WT1" };
-    const onCount = (calls: OrderCall[]) => calls.filter((c) => c.value === "ON").length;
+    const onCount = (calls: OrderCall[]) =>
+      calls.filter((c) => c.value === "ON").length;
 
     it("computes and displays a daily target from the current water temp on day one", () => {
       vi.setSystemTime(new Date("2026-08-06T08:00:00"));
-      const { ctx, state } = buildCtx({ waterTemp: 25, sunlight: SUN, tariff: TARIFF });
+      const { ctx, state } = buildCtx({
+        waterTemp: 25,
+        sunlight: SUN,
+        tariff: TARIFF,
+      });
       const handle = createRecipe().createInstance(
         { ...AUTO, runOnSurplus: false },
         ctx as never,
@@ -688,8 +798,15 @@ describe("smart filtration (v1.2.0, auto model)", () => {
 
     it("publishes state.summary with progress + the active rule (recipe card status line)", () => {
       vi.setSystemTime(new Date("2026-08-06T18:00:00")); // near sunset → daytime floor drives it ON
-      const { ctx, state } = buildCtx({ waterTemp: 25, sunlight: SUN, tariff: TARIFF });
-      const handle = createRecipe().createInstance({ ...AUTO, runOnSurplus: false }, ctx as never);
+      const { ctx, state } = buildCtx({
+        waterTemp: 25,
+        sunlight: SUN,
+        tariff: TARIFF,
+      });
+      const handle = createRecipe().createInstance(
+        { ...AUTO, runOnSurplus: false },
+        ctx as never,
+      );
       const summary = state.get("summary");
       expect(typeof summary).toBe("string");
       expect(summary).toContain("Filtration");
@@ -702,19 +819,33 @@ describe("smart filtration (v1.2.0, auto model)", () => {
       // Same filtration day already recorded → rolloverIfNeeded early-returns, so
       // without the init seed the target would stay unset until the next 06:00.
       vi.setSystemTime(new Date("2026-08-06T15:00:00"));
-      const { ctx, state } = buildCtx({ waterTemp: 25, sunlight: SUN, tariff: TARIFF });
+      const { ctx, state } = buildCtx({
+        waterTemp: 25,
+        sunlight: SUN,
+        tariff: TARIFF,
+      });
       state.set("day", "2026-08-06"); // mid-day switch to auto (day already set)
-      const handle = createRecipe().createInstance({ ...AUTO, runOnSurplus: false }, ctx as never);
+      const handle = createRecipe().createInstance(
+        { ...AUTO, runOnSurplus: false },
+        ctx as never,
+      );
       expect(state.get("targetHours")).toBe(10); // seeded now from the current reading, not 0
       handle.stop();
     });
 
     it("seeds the target from yesterday's average when available (not the current reading)", () => {
       vi.setSystemTime(new Date("2026-08-06T15:00:00"));
-      const { ctx, state } = buildCtx({ waterTemp: 30, sunlight: SUN, tariff: TARIFF }); // now 30 → would be 12h
+      const { ctx, state } = buildCtx({
+        waterTemp: 30,
+        sunlight: SUN,
+        tariff: TARIFF,
+      }); // now 30 → would be 12h
       state.set("day", "2026-08-06");
       state.set("waterTempYesterday", 20); // yesterday avg 20 → 8h wins
-      const handle = createRecipe().createInstance({ ...AUTO, runOnSurplus: false }, ctx as never);
+      const handle = createRecipe().createInstance(
+        { ...AUTO, runOnSurplus: false },
+        ctx as never,
+      );
       expect(state.get("targetHours")).toBe(8); // 20 * 12/30, yesterday's average preferred
       expect(state.get("waterTempUsed")).toBe(20);
       handle.stop();
@@ -740,10 +871,18 @@ describe("smart filtration (v1.2.0, auto model)", () => {
       expect(onCount(orderCalls)).toBe(0); // no rule fires without a grant
       arb.grant();
       await vi.advanceTimersByTimeAsync(1);
-      expect(orderCalls).toContainEqual({ equipmentId: "P1", alias: "state", value: "ON" });
+      expect(orderCalls).toContainEqual({
+        equipmentId: "P1",
+        alias: "state",
+        value: "ON",
+      });
       arb.revoke();
       await vi.advanceTimersByTimeAsync(1);
-      expect(orderCalls).toContainEqual({ equipmentId: "P1", alias: "state", value: "OFF" });
+      expect(orderCalls).toContainEqual({
+        equipmentId: "P1",
+        alias: "state",
+        value: "OFF",
+      });
       handle.stop();
     });
 
@@ -759,7 +898,11 @@ describe("smart filtration (v1.2.0, auto model)", () => {
         { ...AUTO, runOnSurplus: false },
         ctx as never,
       );
-      expect(orderCalls).toContainEqual({ equipmentId: "P1", alias: "state", value: "ON" });
+      expect(orderCalls).toContainEqual({
+        equipmentId: "P1",
+        alias: "state",
+        value: "ON",
+      });
       handle.stop();
     });
 
@@ -768,7 +911,10 @@ describe("smart filtration (v1.2.0, auto model)", () => {
       // surplus / off-peak first) — it must NOT run eagerly.
       vi.setSystemTime(new Date("2026-08-06T11:00:00")); // daytime, not in an HC slot
       const a = buildCtx({ waterTemp: 25, sunlight: SUN, tariff: TARIFF });
-      const h1 = createRecipe().createInstance({ ...AUTO, runOnSurplus: false }, a.ctx as never);
+      const h1 = createRecipe().createInstance(
+        { ...AUTO, runOnSurplus: false },
+        a.ctx as never,
+      );
       expect(a.orderCalls.some((c) => c.value === "ON")).toBe(false); // deferred
       h1.stop();
     });
@@ -776,9 +922,20 @@ describe("smart filtration (v1.2.0, auto model)", () => {
     it("rule 3: the daytime floor DOES fire near sunset (deficit can't be deferred further)", () => {
       // SUN sunset 20:00, floor 3 h → at 18:00 only 2 h of daylight remain < 3 h deficit.
       vi.setSystemTime(new Date("2026-08-06T18:00:00"));
-      const { ctx, orderCalls } = buildCtx({ waterTemp: 25, sunlight: SUN, tariff: TARIFF });
-      const handle = createRecipe().createInstance({ ...AUTO, runOnSurplus: false }, ctx as never);
-      expect(orderCalls).toContainEqual({ equipmentId: "P1", alias: "state", value: "ON" });
+      const { ctx, orderCalls } = buildCtx({
+        waterTemp: 25,
+        sunlight: SUN,
+        tariff: TARIFF,
+      });
+      const handle = createRecipe().createInstance(
+        { ...AUTO, runOnSurplus: false },
+        ctx as never,
+      );
+      expect(orderCalls).toContainEqual({
+        equipmentId: "P1",
+        alias: "state",
+        value: "ON",
+      });
       handle.stop();
     });
 
@@ -810,12 +967,20 @@ describe("smart filtration (v1.2.0, auto model)", () => {
 
     it("rule 4: runs the pre-dawn night safety net so the target is met", () => {
       vi.setSystemTime(new Date("2026-08-06T05:50:00")); // after night HC, before the 06:00 boundary
-      const { ctx, orderCalls } = buildCtx({ waterTemp: 25, sunlight: SUN, tariff: TARIFF });
+      const { ctx, orderCalls } = buildCtx({
+        waterTemp: 25,
+        sunlight: SUN,
+        tariff: TARIFF,
+      });
       const handle = createRecipe().createInstance(
         { ...AUTO, runOnSurplus: false },
         ctx as never,
       );
-      expect(orderCalls).toContainEqual({ equipmentId: "P1", alias: "state", value: "ON" });
+      expect(orderCalls).toContainEqual({
+        equipmentId: "P1",
+        alias: "state",
+        value: "ON",
+      });
       handle.stop();
     });
 
@@ -842,7 +1007,11 @@ describe("smart filtration (v1.2.0, auto model)", () => {
         ctx as never,
       );
       // The deadline engages: the pump is commanded ON.
-      expect(orderCalls).toContainEqual({ equipmentId: "P1", alias: "state", value: "ON" });
+      expect(orderCalls).toContainEqual({
+        equipmentId: "P1",
+        alias: "state",
+        value: "ON",
+      });
       // Model the float/measurement jitter that flipped the raw threshold on
       // prod: bump runtime a few seconds so remainingH dips just under the
       // (now smaller) boundary. Pre-fix this makes the next tick compute OFF.
@@ -860,7 +1029,11 @@ describe("smart filtration (v1.2.0, auto model)", () => {
       // the bare `>=` chattered ON/OFF every 30 s. Once engaged before sunset it
       // must LATCH ON until the daytime minimum is met.
       vi.setSystemTime(new Date("2026-08-15T20:24:00")); // before sunset, not in an HC slot
-      const nearSunset = { sunrise: "07:00", sunset: "20:48", isDaylight: true };
+      const nearSunset = {
+        sunrise: "07:00",
+        sunset: "20:48",
+        isDaylight: true,
+      };
       const { ctx, state, orderCalls, getPumpState } = buildCtx({
         waterTemp: 25,
         sunlight: nearSunset,
@@ -875,7 +1048,11 @@ describe("smart filtration (v1.2.0, auto model)", () => {
         { ...AUTO, runOnSurplus: false, daytimeMinHours: 6 },
         ctx as never,
       );
-      expect(orderCalls).toContainEqual({ equipmentId: "P1", alias: "state", value: "ON" });
+      expect(orderCalls).toContainEqual({
+        equipmentId: "P1",
+        alias: "state",
+        value: "ON",
+      });
       // Jitter nudges the deficit just under hoursUntilSunset → pre-fix OFF.
       state.set("daytimeSecondsToday", 5.61 * 3600 + 40);
       await vi.advanceTimersByTimeAsync(3 * 30_000);
@@ -892,15 +1069,30 @@ describe("smart filtration (v1.2.0, auto model)", () => {
         offPeakToday: [{ start: "11:00", end: "16:00" }],
         isOffPeakNow: null,
       };
-      const { ctx, orderCalls } = buildCtx({ waterTemp: 25, sunlight: SUN, tariff: middayHc });
-      const handle = createRecipe().createInstance({ ...AUTO, runOnSurplus: false }, ctx as never);
-      expect(orderCalls).toContainEqual({ equipmentId: "P1", alias: "state", value: "ON" }); // via midday off-peak
+      const { ctx, orderCalls } = buildCtx({
+        waterTemp: 25,
+        sunlight: SUN,
+        tariff: middayHc,
+      });
+      const handle = createRecipe().createInstance(
+        { ...AUTO, runOnSurplus: false },
+        ctx as never,
+      );
+      expect(orderCalls).toContainEqual({
+        equipmentId: "P1",
+        alias: "state",
+        value: "ON",
+      }); // via midday off-peak
       handle.stop();
     });
 
     it("stops once the daily target is reached", async () => {
       vi.setSystemTime(new Date("2026-08-06T18:00:00")); // near sunset → floor drives it ON
-      const { ctx, orderCalls } = buildCtx({ waterTemp: 30, sunlight: SUN, tariff: TARIFF });
+      const { ctx, orderCalls } = buildCtx({
+        waterTemp: 30,
+        sunlight: SUN,
+        tariff: TARIFF,
+      });
       const handle = createRecipe().createInstance(
         {
           ...AUTO,
@@ -911,9 +1103,15 @@ describe("smart filtration (v1.2.0, auto model)", () => {
         },
         ctx as never,
       );
-      expect(orderCalls).toContainEqual({ equipmentId: "P1", alias: "state", value: "ON" });
+      expect(orderCalls).toContainEqual({
+        equipmentId: "P1",
+        alias: "state",
+        value: "ON",
+      });
       await vi.advanceTimersByTimeAsync(65 * 60_000); // > 1 h target → OFF
-      expect(orderCalls.filter((c) => c.value === "OFF").length).toBeGreaterThanOrEqual(1);
+      expect(
+        orderCalls.filter((c) => c.value === "OFF").length,
+      ).toBeGreaterThanOrEqual(1);
       handle.stop();
     });
 
@@ -921,7 +1119,11 @@ describe("smart filtration (v1.2.0, auto model)", () => {
       // daytimeMinHours (5) deliberately exceeds the temperature-derived target (2 h).
       // The target gate is master: the pump stops at 2 h and does NOT run the 5 h floor.
       vi.setSystemTime(new Date("2026-08-06T17:00:00")); // floor-fire time, target met before sunset
-      const { ctx, orderCalls } = buildCtx({ waterTemp: 30, sunlight: SUN, tariff: TARIFF });
+      const { ctx, orderCalls } = buildCtx({
+        waterTemp: 30,
+        sunlight: SUN,
+        tariff: TARIFF,
+      });
       const handle = createRecipe().createInstance(
         {
           ...AUTO,
@@ -933,15 +1135,25 @@ describe("smart filtration (v1.2.0, auto model)", () => {
         },
         ctx as never,
       );
-      expect(orderCalls).toContainEqual({ equipmentId: "P1", alias: "state", value: "ON" }); // floor fires
+      expect(orderCalls).toContainEqual({
+        equipmentId: "P1",
+        alias: "state",
+        value: "ON",
+      }); // floor fires
       await vi.advanceTimersByTimeAsync(2 * 3600_000 + 5 * 60_000); // just past the 2 h target
-      expect(orderCalls.filter((c) => c.value === "OFF").length).toBeGreaterThanOrEqual(1); // capped at target
+      expect(
+        orderCalls.filter((c) => c.value === "OFF").length,
+      ).toBeGreaterThanOrEqual(1); // capped at target
       handle.stop();
     });
 
     it("finalises yesterday's average water temp at the 06:00 filtration-day boundary", async () => {
       vi.setSystemTime(new Date("2026-08-06T04:30:00")); // pre-dawn = previous filtration day
-      const { ctx, state } = buildCtx({ waterTemp: 22, sunlight: SUN, tariff: TARIFF });
+      const { ctx, state } = buildCtx({
+        waterTemp: 22,
+        sunlight: SUN,
+        tariff: TARIFF,
+      });
       const handle = createRecipe().createInstance(
         { ...AUTO, runOnSurplus: false, minFiltrationHours: 0 },
         ctx as never,
@@ -955,23 +1167,44 @@ describe("smart filtration (v1.2.0, auto model)", () => {
 
     it("no arbiter on the core: off-peak/daytime/deadline rules still drive, no crash", () => {
       vi.setSystemTime(new Date("2026-08-06T15:00:00")); // inside the 14:34-17:04 off-peak slot
-      const { ctx, orderCalls } = buildCtx({ waterTemp: 25, sunlight: SUN, tariff: TARIFF }); // no energy
+      const { ctx, orderCalls } = buildCtx({
+        waterTemp: 25,
+        sunlight: SUN,
+        tariff: TARIFF,
+      }); // no energy
       const handle = createRecipe().createInstance(
         { ...AUTO, runOnSurplus: true }, // requested, but no arbiter → falls back to off-peak
         ctx as never,
       );
-      expect(orderCalls).toContainEqual({ equipmentId: "P1", alias: "state", value: "ON" });
+      expect(orderCalls).toContainEqual({
+        equipmentId: "P1",
+        alias: "state",
+        value: "ON",
+      });
       handle.stop();
     });
 
     it("optional fixed windows still force the pump on in auto mode", () => {
       vi.setSystemTime(new Date("2026-08-06T21:30:00")); // evening, no auto rule active
-      const { ctx, orderCalls } = buildCtx({ waterTemp: 25, sunlight: SUN, tariff: TARIFF });
+      const { ctx, orderCalls } = buildCtx({
+        waterTemp: 25,
+        sunlight: SUN,
+        tariff: TARIFF,
+      });
       const handle = createRecipe().createInstance(
-        { ...AUTO, runOnSurplus: false, slot1_start: "21:00", slot1_end: "22:00" },
+        {
+          ...AUTO,
+          runOnSurplus: false,
+          slot1_start: "21:00",
+          slot1_end: "22:00",
+        },
         ctx as never,
       );
-      expect(orderCalls).toContainEqual({ equipmentId: "P1", alias: "state", value: "ON" });
+      expect(orderCalls).toContainEqual({
+        equipmentId: "P1",
+        alias: "state",
+        value: "ON",
+      });
       handle.stop();
     });
 
@@ -984,12 +1217,19 @@ describe("smart filtration (v1.2.0, auto model)", () => {
         sunlight: SUN,
         tariff: TARIFF,
       });
-      const handle = createRecipe().createInstance({ ...AUTO, runOnSurplus: true }, ctx as never);
+      const handle = createRecipe().createInstance(
+        { ...AUTO, runOnSurplus: true },
+        ctx as never,
+      );
       arb.grant();
       await vi.advanceTimersByTimeAsync(1);
-      expect(logLines.some((l) => l.includes("Surplus solaire accordé"))).toBe(true);
+      expect(logLines.some((l) => l.includes("Surplus solaire accordé"))).toBe(
+        true,
+      );
       expect(
-        logLines.some((l) => l.includes("→ ON via surplus") && l.includes("/8.0 h")),
+        logLines.some(
+          (l) => l.includes("→ ON via surplus") && l.includes("/8.0 h"),
+        ),
       ).toBe(true);
       handle.stop();
     });
@@ -1002,9 +1242,14 @@ describe("smart filtration (v1.2.0, auto model)", () => {
         sunlight: { sunrise: "07:00", sunset: "13:00", isDaylight: true },
         tariff: TARIFF,
       });
-      const handle = createRecipe().createInstance({ ...AUTO, runOnSurplus: false }, ctx as never);
+      const handle = createRecipe().createInstance(
+        { ...AUTO, runOnSurplus: false },
+        ctx as never,
+      );
       await vi.advanceTimersByTimeAsync(6 * 60_000); // cross into the 14:34 HC slot
-      expect(logLines.some((l) => l.includes("→ ON via heures creuses"))).toBe(true);
+      expect(logLines.some((l) => l.includes("→ ON via heures creuses"))).toBe(
+        true,
+      );
       handle.stop();
     });
 
@@ -1013,10 +1258,21 @@ describe("smart filtration (v1.2.0, auto model)", () => {
       const { ctx, orderCalls } = buildCtx({
         waterTemp: 25,
         sunlight: { sunrise: 700, sunset: null, isDaylight: null }, // numeric/null → fallback 08:00-20:00
-        tariff: { configured: true, offPeakToday: undefined, isOffPeakNow: null }, // not an array
+        tariff: {
+          configured: true,
+          offPeakToday: undefined,
+          isOffPeakNow: null,
+        }, // not an array
       });
-      const handle = createRecipe().createInstance({ ...AUTO, runOnSurplus: false }, ctx as never);
-      expect(orderCalls).toContainEqual({ equipmentId: "P1", alias: "state", value: "ON" }); // daytime floor
+      const handle = createRecipe().createInstance(
+        { ...AUTO, runOnSurplus: false },
+        ctx as never,
+      );
+      expect(orderCalls).toContainEqual({
+        equipmentId: "P1",
+        alias: "state",
+        value: "ON",
+      }); // daytime floor
       handle.stop();
     });
 
@@ -1029,9 +1285,16 @@ describe("smart filtration (v1.2.0, auto model)", () => {
       (b.ctx.helpers as Record<string, unknown>).getSunlight = () => {
         throw new Error("boom");
       };
-      const handle = createRecipe().createInstance({ ...AUTO, runOnSurplus: false }, b.ctx as never);
+      const handle = createRecipe().createInstance(
+        { ...AUTO, runOnSurplus: false },
+        b.ctx as never,
+      );
       // daytimeMin/inHcSlot catch internally → fallback daytime → floor → ON, no throw.
-      expect(b.orderCalls).toContainEqual({ equipmentId: "P1", alias: "state", value: "ON" });
+      expect(b.orderCalls).toContainEqual({
+        equipmentId: "P1",
+        alias: "state",
+        value: "ON",
+      });
       handle.stop();
     });
 
@@ -1043,7 +1306,10 @@ describe("smart filtration (v1.2.0, auto model)", () => {
         sunlight: { sunrise: "07:00", sunset: "13:00", isDaylight: true },
         tariff: TARIFF,
       });
-      const handle = createRecipe().createInstance({ ...AUTO, runOnSurplus: false }, ctx as never);
+      const handle = createRecipe().createInstance(
+        { ...AUTO, runOnSurplus: false },
+        ctx as never,
+      );
       // Bare auto has NO window edges — a manual order must still be recoverable.
       emit("equipment.order.executed", {
         equipmentId: "P1",
@@ -1189,11 +1455,15 @@ describe("surplus heating (v1.5.0)", () => {
     let heaterSetpoint: unknown = opts.initialSetpoint ?? 10;
     const em = base.ctx.equipmentManager as {
       getById: (id: string) => unknown;
-      getDataBindingsWithValues: (id: string) => Array<{ alias: string; value: unknown }>;
+      getDataBindingsWithValues: (
+        id: string,
+      ) => Array<{ alias: string; value: unknown }>;
     };
     const origBindings = em.getDataBindingsWithValues.bind(em);
     em.getDataBindingsWithValues = (id: string) =>
-      id === "HP1" ? [{ alias: "setpoint", value: heaterSetpoint }] : origBindings(id);
+      id === "HP1"
+        ? [{ alias: "setpoint", value: heaterSetpoint }]
+        : origBindings(id);
     if (opts.profiles) {
       em.getById = (id: string) => ({
         id,
@@ -1238,16 +1508,23 @@ describe("surplus heating (v1.5.0)", () => {
     ).toThrow(/above the idle setpoint/);
   });
 
-  it("claims for the heater with slack high and zero tolerated import; pump claim stays off", () => {
+  it("claims for the heater with slack high and no recipe-level tolerance (profile drives it, #14); pump claim stays off", () => {
     vi.setSystemTime(T2030);
     const arb = makeArbiterMulti();
-    const { ctx } = buildHeatCtx({ waterTemp: 20, energy: arb.energy, sunlight: SUN, tariff: TARIFF });
+    const { ctx } = buildHeatCtx({
+      waterTemp: 20,
+      energy: arb.energy,
+      sunlight: SUN,
+      tariff: TARIFF,
+    });
     const handle = createRecipe().createInstance(HEAT, ctx as never);
     expect(arb.active("HP1")).toBe(true);
     expect(arb.active("P1")).toBe(false); // runOnSurplus false
     const req = arb.reqs.find((r) => r.equipmentId === "HP1")!;
     expect(req.slack).toBe("high");
-    expect(req.toleratedImportW).toBe(0);
+    // The claim no longer carries a tolerance; the arbiter resolves it from the
+    // heater equipment's energyProfile.toleratedImportW (core #550).
+    expect(req.toleratedImportW).toBeUndefined();
     expect(req.watts).toBeUndefined(); // no energy profiles exposed
     handle.stop();
   });
@@ -1280,11 +1557,17 @@ describe("surplus heating (v1.5.0)", () => {
     const handle = createRecipe().createInstance(HEAT, ctx as never);
     // Startup: no grant, binding already at idle (seeded) → nothing to send.
     expect(setpointCalls(orderCalls)).toHaveLength(0);
-    expect(orderCalls.filter((c) => c.alias === "state" && c.value === "ON")).toHaveLength(0);
+    expect(
+      orderCalls.filter((c) => c.alias === "state" && c.value === "ON"),
+    ).toHaveLength(0);
     arb.grant("HP1");
     await vi.advanceTimersByTimeAsync(1);
-    const on = orderCalls.findIndex((c) => c.alias === "state" && c.value === "ON");
-    const hot = orderCalls.findIndex((c) => c.alias === "setpoint" && c.value === 28);
+    const on = orderCalls.findIndex(
+      (c) => c.alias === "state" && c.value === "ON",
+    );
+    const hot = orderCalls.findIndex(
+      (c) => c.alias === "setpoint" && c.value === 28,
+    );
     expect(on).toBeGreaterThan(-1);
     expect(hot).toBeGreaterThan(on); // water flows before the heater is asked to heat
     handle.stop();
@@ -1304,12 +1587,12 @@ describe("surplus heating (v1.5.0)", () => {
     await vi.advanceTimersByTimeAsync(1);
     arb.revoke("HP1");
     await vi.advanceTimersByTimeAsync(1);
-    const idle = orderCalls.map((c, i) => ({ ...c, i })).filter(
-      (c) => c.alias === "setpoint" && c.value === 10,
-    );
-    const off = orderCalls.map((c, i) => ({ ...c, i })).filter(
-      (c) => c.alias === "state" && c.value === "OFF",
-    );
+    const idle = orderCalls
+      .map((c, i) => ({ ...c, i }))
+      .filter((c) => c.alias === "setpoint" && c.value === 10);
+    const off = orderCalls
+      .map((c, i) => ({ ...c, i }))
+      .filter((c) => c.alias === "state" && c.value === "OFF");
     expect(idle.length).toBeGreaterThan(0); // the revoke path
     expect(off.length).toBeGreaterThan(0);
     expect(idle[idle.length - 1].i).toBeLessThan(off[off.length - 1].i);
@@ -1382,7 +1665,9 @@ describe("surplus heating (v1.5.0)", () => {
     await vi.advanceTimersByTimeAsync(16 * 60_000); // past the 15 min denied backoff
     const warns = logLines.filter((l) => l.includes("profil énergie"));
     expect(warns).toHaveLength(1);
-    expect(arb.reqs.filter((r) => r.equipmentId === "HP1").length).toBeGreaterThan(1);
+    expect(
+      arb.reqs.filter((r) => r.equipmentId === "HP1").length,
+    ).toBeGreaterThan(1);
     handle.stop();
   });
 
@@ -1408,7 +1693,9 @@ describe("surplus heating (v1.5.0)", () => {
     expect(state.get("heaterOverride")).toBe(true);
     const setpointsBefore = setpointCalls(orderCalls).length;
     await vi.advanceTimersByTimeAsync(61_000); // claim released → pump transitions OFF
-    expect(orderCalls.some((c) => c.alias === "state" && c.value === "OFF")).toBe(true);
+    expect(
+      orderCalls.some((c) => c.alias === "state" && c.value === "OFF"),
+    ).toBe(true);
     // The pre-OFF setpoint lowering must NOT fire under the dérogation.
     expect(setpointCalls(orderCalls)).toHaveLength(setpointsBefore);
     expect(getSetpoint()).toBe(28); // the user's value stands
@@ -1431,8 +1718,12 @@ describe("surplus heating (v1.5.0)", () => {
     state.set("day", "2026-08-06");
     state.set("runSecondsToday", 9 * 3600); // above the 8 h target (water 20)
     const handle = createRecipe().createInstance(HEAT, ctx as never);
-    const idle = orderCalls.findIndex((c) => c.alias === "setpoint" && c.value === 10);
-    const off = orderCalls.findIndex((c) => c.alias === "state" && c.value === "OFF");
+    const idle = orderCalls.findIndex(
+      (c) => c.alias === "setpoint" && c.value === 10,
+    );
+    const off = orderCalls.findIndex(
+      (c) => c.alias === "state" && c.value === "OFF",
+    );
     expect(idle).toBeGreaterThan(-1);
     expect(off).toBeGreaterThan(-1);
     expect(idle).toBeLessThan(off); // heater calmed before its water flow stops
@@ -1474,13 +1765,15 @@ describe("surplus heating (v1.5.0)", () => {
     handle.stop();
     await vi.advanceTimersByTimeAsync(1);
     expect(getSetpoint()).toBe(10);
-    const idleIdx = orderCalls.map((c, i) => ({ ...c, i })).filter(
-      (c) => c.alias === "setpoint" && c.value === 10,
+    const idleIdx = orderCalls
+      .map((c, i) => ({ ...c, i }))
+      .filter((c) => c.alias === "setpoint" && c.value === 10);
+    const offIdx = orderCalls
+      .map((c, i) => ({ ...c, i }))
+      .filter((c) => c.alias === "state" && c.value === "OFF");
+    expect(idleIdx[idleIdx.length - 1].i).toBeLessThan(
+      offIdx[offIdx.length - 1].i,
     );
-    const offIdx = orderCalls.map((c, i) => ({ ...c, i })).filter(
-      (c) => c.alias === "state" && c.value === "OFF",
-    );
-    expect(idleIdx[idleIdx.length - 1].i).toBeLessThan(offIdx[offIdx.length - 1].i);
     expect(arb.active("HP1")).toBe(false);
   });
 });
