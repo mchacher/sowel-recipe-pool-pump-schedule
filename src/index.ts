@@ -29,6 +29,18 @@
  *
  * Stopping the instance mid-cycle overrides the schedule: the pump
  * receives an explicit OFF and all timers are cancelled.
+ *
+ * v1.5.0 adds optional solar-surplus pool heating for a heat pump that
+ * exposes a `setpoint` order (e.g. Polytropic in SMART mode). The lever is
+ * deliberately the setpoint, never a power cut: on an arbiter grant the
+ * recipe raises the setpoint to the heating target, otherwise it holds it
+ * at a low idle value and the heat pump's own regulation stops the
+ * compressor. The heater claim is separate from the pump claim (slack
+ * "high", toleratedImportW default 0 so heating never imports), and a
+ * heater grant keeps the pump running — heating implies water flow — even
+ * once the filtration target is met. The setpoint is always lowered before
+ * any pump OFF the recipe sends. Heating never runs on off-peak or the
+ * deadline catch-up: no surplus, no heating.
  */
 
 // ============================================================
@@ -391,6 +403,52 @@ function buildSlots(): RecipeSlotDef[] {
       group: "filtration",
     },
 
+    // Solar-surplus heating (optional). Setting a heat pump turns on
+    // setpoint-lever heating on arbiter surplus grants only.
+    {
+      id: "heater",
+      name: "Pool heat pump",
+      description:
+        "Heat pump to run on solar surplus, driven through its temperature setpoint (it must expose a 'setpoint' order). Leave empty to disable heating.",
+      type: "equipment",
+      required: false,
+      constraints: { equipmentType: "pool_heat_pump" },
+      group: "heating",
+    },
+    {
+      id: "heatingTargetTemp",
+      name: "Heating target (°C)",
+      description:
+        "Water temperature to reach on surplus. The setpoint is raised to this value while the arbiter grants surplus, with a 0.5 °C hysteresis.",
+      type: "number",
+      required: false,
+      defaultValue: 28,
+      constraints: { min: 15, max: 30 },
+      group: "heating",
+    },
+    {
+      id: "heaterIdleSetpoint",
+      name: "Idle setpoint (°C)",
+      description:
+        "Setpoint held outside surplus grants. Use the heat pump's minimum so it never heats on grid power (default 10).",
+      type: "number",
+      required: false,
+      defaultValue: 10,
+      constraints: { min: 5, max: 25 },
+      group: "heating",
+    },
+    {
+      id: "heaterToleratedImportW",
+      name: "Heating partial-surplus tolerance (W)",
+      description:
+        "Grid import the heat pump accepts to catch a partial surplus. Keep 0 to heat strictly on full surplus (minimal consumption).",
+      type: "number",
+      required: false,
+      defaultValue: 0,
+      constraints: { min: 0, max: 3000 },
+      group: "heating",
+    },
+
     // Slot 1 — only conditionally required: mandatory in schedule mode, optional
     // in auto mode (a water-temp sensor is set). A static `required: true` would
     // let the UI block clearing it even in auto mode, so it is marked optional
@@ -457,7 +515,7 @@ function buildSlots(): RecipeSlotDef[] {
 const FR: RecipeLangPack = {
   name: "Programmation pompe piscine",
   description:
-    "Pilotage de pompe de piscine : créneaux horaires quotidiens, cible de temps de filtration selon la température de l'eau (option) et fonctionnement sur surplus solaire (option).",
+    "Pilotage de pompe de piscine : créneaux horaires quotidiens, cible de temps de filtration selon la température de l'eau (option), fonctionnement sur surplus solaire (option) et chauffage PAC sur surplus solaire (option).",
   slots: {
     zone: { name: "Zone", description: "Zone de la pompe" },
     pump: { name: "Pompe de piscine", description: "Pompe à piloter" },
@@ -499,12 +557,33 @@ const FR: RecipeLangPack = {
       description:
         "Import réseau que la pompe accepte pour capter un surplus partiel (0 = seulement sur surplus complet). Plus haut = démarre sur un surplus plus faible.",
     },
+    heater: {
+      name: "PAC piscine",
+      description:
+        "Pompe à chaleur à faire tourner sur surplus solaire, pilotée par sa consigne de température (elle doit exposer un ordre 'setpoint'). Laisser vide pour désactiver le chauffage.",
+    },
+    heatingTargetTemp: {
+      name: "Cible de chauffage (°C)",
+      description:
+        "Température d'eau visée sur surplus. La consigne monte à cette valeur tant que l'arbitre accorde du surplus, avec une hystérésis de 0,5 °C.",
+    },
+    heaterIdleSetpoint: {
+      name: "Consigne de repos (°C)",
+      description:
+        "Consigne maintenue hors surplus. Mettez le minimum de la PAC pour qu'elle ne chauffe jamais sur le réseau (défaut 10).",
+    },
+    heaterToleratedImportW: {
+      name: "Tolérance surplus partiel chauffage (W)",
+      description:
+        "Import réseau que la PAC accepte pour capter un surplus partiel. Laissez 0 pour chauffer strictement sur surplus complet (conso minimale).",
+    },
   },
   groups: {
     slot1: "Créneau 1",
     slot2: "Créneau 2",
     slot3: "Créneau 3",
     filtration: "Filtration intelligente",
+    heating: "Chauffage sur surplus",
   },
 };
 
@@ -517,7 +596,7 @@ export function createRecipe(): RecipeDefinition {
     id: "pool-pump-schedule",
     name: "Pool Pump Schedule",
     description:
-      "Pool pump control: daily schedule windows, an optional water-temperature filtration-time target, and optional solar-surplus running.",
+      "Pool pump control: daily schedule windows, an optional water-temperature filtration-time target, optional solar-surplus running, and optional heat-pump pool heating on solar surplus.",
     slots: buildSlots(),
     i18n: { fr: FR },
 
@@ -527,6 +606,20 @@ export function createRecipe(): RecipeDefinition {
       }
       if (!params.pump) {
         throw new Error("Pool pump is required");
+      }
+
+      // Surplus heating: needs the water reading to gate the claim, and a
+      // target strictly above the idle setpoint (equal would never disengage).
+      // Checked before the slot rules so the user gets the meaningful error.
+      if (typeof params.heater === "string" && params.heater) {
+        if (!(typeof params.waterTempSensor === "string" && params.waterTempSensor)) {
+          throw new Error("Surplus heating requires a water temperature sensor");
+        }
+        const target = Number(params.heatingTargetTemp ?? 28);
+        const idle = Number(params.heaterIdleSetpoint ?? 10);
+        if (Number.isFinite(target) && Number.isFinite(idle) && target <= idle) {
+          throw new Error("Heating target must be above the idle setpoint");
+        }
       }
 
       // In schedule mode (no water-temp sensor) slot 1 is required; in AUTO
@@ -584,6 +677,15 @@ export function createRecipe(): RecipeDefinition {
       const daytimeMinHours = Number(params.daytimeMinHours ?? 3);
       const runOnSurplus = params.runOnSurplus !== false; // default on in auto mode
       const toleratedImportW = Math.max(0, Number(params.toleratedImportW ?? 300));
+
+      // Surplus heating (v1.5.0, all optional — inert when no heater is set).
+      const heaterId =
+        typeof params.heater === "string" && params.heater ? params.heater : null;
+      const hasHeater = heaterId !== null; // validate() guarantees a water sensor with it
+      const heatingTargetTemp = Number(params.heatingTargetTemp ?? 28);
+      const heaterIdleSetpoint = Number(params.heaterIdleSetpoint ?? 10);
+      const heaterToleratedImportW = Math.max(0, Number(params.heaterToleratedImportW ?? 0));
+      const HEAT_HYSTERESIS_C = 0.5;
       const DAY_START_HOUR = 6; // filtration-day reset (early morning): the target is set
       // for the day ahead, so the pre-boundary hours are the last-resort deadline window
       // and the pump favours surplus/off-peak/daytime first. Independent of tariff timing.
@@ -622,6 +724,14 @@ export function createRecipe(): RecipeDefinition {
       let arbiterGranted = false;
       let tickScheduled = false;
 
+      // Heater claim state (v1.5.0) — a second, independent claim.
+      let heaterClaim: CapacityHandle | null = null;
+      let heaterGranted = false;
+      let heaterDeniedLogged = false;
+      let lastHeaterDispatch = 0;
+      let lastHeaterCorrection = 0;
+      let lastCommandedSetpoint: number | null = null; // what WE last sent, null before first send
+
       async function sendOrder(value: "ON" | "OFF"): Promise<void> {
         lastOwnDispatch = Date.now();
         if (ctx.dispatchOrder) {
@@ -633,6 +743,17 @@ export function createRecipe(): RecipeDefinition {
 
       async function dispatch(value: "ON" | "OFF"): Promise<void> {
         try {
+          // Hard sequencing rule: the heater setpoint is lowered BEFORE any
+          // pump OFF this recipe sends — the heat pump must be told to stop
+          // heating before its water flow goes away.
+          if (
+            value === "OFF" &&
+            hasHeater &&
+            lastCommandedSetpoint !== null &&
+            lastCommandedSetpoint !== heaterIdleSetpoint
+          ) {
+            await dispatchHeaterSetpoint(heaterIdleSetpoint);
+          }
           await sendOrder(value);
         } catch (err: unknown) {
           const msg = err instanceof Error ? err.message : String(err);
@@ -659,6 +780,183 @@ export function createRecipe(): RecipeDefinition {
           bindings?.find((x) => x.alias === waterTempAlias) ??
           bindings?.find((x) => x.alias === "temperature");
         return b ? normalizeTemp(b.value) : null;
+      }
+
+      // ── Surplus heating (v1.5.0) ──
+
+      const heaterName = (): string =>
+        heaterId ? ctx.equipmentManager.getById(heaterId)?.name ?? heaterId.slice(0, 8) : "?";
+
+      /** Observed heater setpoint (°C), null when the core cannot expose it. */
+      function readHeaterSetpoint(): number | null {
+        if (!heaterId) return null;
+        const bindings = ctx.equipmentManager.getDataBindingsWithValues?.(heaterId);
+        const b = bindings?.find((x) => x.alias === "setpoint");
+        return b ? normalizeTemp(b.value) : null;
+      }
+
+      /**
+       * Heating still wanted, with a 0.5 °C hysteresis latched in state:
+       * satisfied at the target, re-engaged half a degree below it. An
+       * unreadable water temperature keeps the last latch (self-corrects on
+       * the first valid reading once the pump runs).
+       */
+      function heatingNeeded(): boolean {
+        if (!hasHeater) return false;
+        const t = readWaterTemp();
+        if (t !== null) {
+          if (t >= heatingTargetTemp) setIfChanged("heatSatisfied", true);
+          else if (t <= heatingTargetTemp - HEAT_HYSTERESIS_C) setIfChanged("heatSatisfied", false);
+        }
+        return ctx.state.get("heatSatisfied") !== true;
+      }
+
+      /** Send the heater setpoint order; errors are logged, never thrown. */
+      async function dispatchHeaterSetpoint(value: number): Promise<void> {
+        if (!heaterId) return;
+        lastHeaterDispatch = Date.now();
+        lastCommandedSetpoint = value;
+        try {
+          if (ctx.dispatchOrder) {
+            await ctx.dispatchOrder(heaterId, "setpoint", value);
+          } else {
+            await ctx.equipmentManager.executeOrder(heaterId, "setpoint", value);
+          }
+        } catch (err: unknown) {
+          const msg = err instanceof Error ? err.message : String(err);
+          ctx.log(`Erreur consigne ${value}°C PAC ${heaterName()}: ${msg}`, "error");
+        }
+      }
+
+      /**
+       * The heater is engaged (setpoint at target) only when ALL hold: the
+       * arbiter granted its claim, heating is still needed, and the pump is
+       * OBSERVED running — the heat pump must never work without water flow.
+       */
+      function heaterEngaged(): boolean {
+        return (
+          hasHeater &&
+          heaterGranted &&
+          heatingNeeded() &&
+          readPumpState() === "ON" &&
+          ctx.state.get("override") !== true &&
+          ctx.state.get("heaterOverride") !== true
+        );
+      }
+
+      /**
+       * Hold the heater claim while heating is wanted. The claim is separate
+       * from the pump's, slack "high" (first shed), and declares pump + heater
+       * watts together: engaging heating may have to START the pump, so the
+       * surplus must cover both to guarantee zero import at engagement.
+       */
+      function manageHeaterClaim(): void {
+        if (!hasHeater) return;
+        let enabled = false;
+        try {
+          enabled = !!ctx.helpers.energy && ctx.helpers.energy.getCapacityState().enabled;
+        } catch {
+          enabled = false;
+        }
+        const want =
+          enabled &&
+          heatingNeeded() &&
+          ctx.state.get("override") !== true &&
+          ctx.state.get("heaterOverride") !== true;
+        if (want && !heaterClaim && ctx.helpers.energy) {
+          const nominal = (id: string): number | null => {
+            const eq = ctx.equipmentManager.getById(id) as {
+              energyProfile?: { nominalPowerW?: number };
+            } | null;
+            const w = eq?.energyProfile?.nominalPowerW;
+            return typeof w === "number" && Number.isFinite(w) && w > 0 ? w : null;
+          };
+          try {
+            const heaterW = nominal(heaterId!);
+            const pumpW = nominal(pumpId);
+            heaterClaim =
+              ctx.helpers.energy.claimCapacity({
+                equipmentId: heaterId!,
+                ...(heaterW !== null && pumpW !== null ? { watts: heaterW + pumpW } : {}),
+                toleratedImportW: heaterToleratedImportW,
+                slack: "high", // lowest urgency — served last, shed first
+                note: "pool heating on surplus",
+                onGranted: () => {
+                  heaterGranted = true;
+                  ctx.log(`Surplus accordé pour le chauffage PAC ${heaterName()}${progress()}`);
+                  scheduleTick();
+                },
+                onRevoked: (why: string) => {
+                  heaterGranted = false;
+                  ctx.log(`Surplus chauffage retiré par l'arbitre (${why})${progress()}`);
+                  scheduleTick();
+                },
+              }) ?? null;
+            if (heaterClaim && heaterClaim.status() === "denied") {
+              if (!heaterDeniedLogged) {
+                heaterDeniedLogged = true;
+                const why = heaterClaim.deniedReason ?? "inconnu";
+                ctx.log(
+                  why === "not-profiled"
+                    ? `Chauffage refusé par l'arbitre : la PAC ${heaterName()} n'a pas de profil énergie. Renseignez son profil (puissance nominale, minOnS/minOffS) dans Équipements.`
+                    : `Chauffage refusé par l'arbitre (${why})`,
+                  "warn",
+                );
+              }
+              heaterClaim.release();
+              heaterClaim = null; // retry on a later tick (the profile may get set)
+            } else if (heaterClaim) {
+              heaterDeniedLogged = false;
+            }
+          } catch (err) {
+            ctx.logger.error({ err }, "pool-pump: heater claimCapacity failed");
+            heaterClaim = null;
+          }
+        } else if (!want && heaterClaim) {
+          try {
+            heaterClaim.release();
+          } catch {
+            /* a broken handle must not break the recipe */
+          }
+          heaterClaim = null;
+          heaterGranted = false;
+        }
+      }
+
+      /**
+       * Drive the setpoint toward the engaged/idle value. Transitions dispatch
+       * immediately; drift against a readable setpoint binding is corrected
+       * under the same cooldown discipline as the pump. Stands down under a
+       * heater dérogation (manual setpoint change).
+       */
+      function reconcileHeater(reason: string): void {
+        if (!hasHeater) return;
+        const engaged = heaterEngaged();
+        setIfChanged("heating", engaged ? "en cours" : heaterGranted ? "attente pompe" : null);
+        if (ctx.state.get("heaterOverride") === true) return;
+        const desired = engaged ? heatingTargetTemp : heaterIdleSetpoint;
+        if (lastCommandedSetpoint !== desired) {
+          ctx.log(
+            engaged
+              ? `Chauffage PAC ${heaterName()} → consigne ${desired}°C via surplus (${reason})${progress()}`
+              : `Chauffage PAC ${heaterName()} → consigne de repos ${desired}°C (${reason})${progress()}`,
+          );
+          void dispatchHeaterSetpoint(desired);
+          return;
+        }
+        const actual = readHeaterSetpoint();
+        if (
+          actual !== null &&
+          Math.abs(actual - desired) > 0.25 &&
+          Date.now() - lastHeaterCorrection >= CORRECTION_COOLDOWN_MS
+        ) {
+          lastHeaterCorrection = Date.now();
+          ctx.log(
+            `Réconciliation (${reason}) — consigne PAC ${heaterName()} ${actual}°C au lieu de ${desired}°C, ordre correctif`,
+            "warn",
+          );
+          void dispatchHeaterSetpoint(desired);
+        }
       }
 
       // Daylight bounds from the core, with a fixed fallback.
@@ -777,6 +1075,10 @@ export function createRecipe(): RecipeDefinition {
        */
       function desiredState(now: Date): "ON" | "OFF" {
         if (activeWindow(now, windows) !== null) return "ON"; // optional forced windows
+        // A granted heater claim holds the pump: heating implies water flow,
+        // even once the filtration target is met (free energy, and the extra
+        // run time counts toward filtration anyway).
+        if (hasHeater && heaterGranted && heatingNeeded()) return "ON";
         if (!hasTarget) return "OFF"; // schedule-only (v1.1.0)
         if (!belowTarget()) return "OFF"; // daily target reached → stop
         if (runOnSurplus && arbiterGranted) return "ON"; // 1. solar surplus (free/partial)
@@ -791,6 +1093,7 @@ export function createRecipe(): RecipeDefinition {
       function currentReason(now: Date): string {
         const w = activeWindow(now, windows);
         if (w) return windowLabel(w);
+        if (hasHeater && heaterGranted && heatingNeeded()) return "chauffage PAC (surplus)";
         if (runOnSurplus && arbiterGranted) return "surplus";
         if (inHcSlot(now)) return "heures creuses";
         if (daytimeFloorDue(now)) return "journée";
@@ -839,12 +1142,13 @@ export function createRecipe(): RecipeDefinition {
         const fmt = (h: number): string =>
           (Number.isInteger(h) ? String(h) : (Math.round(h * 10) / 10).toFixed(1)).replace(".", ",");
         const prog = `${fmt(Math.round(runH * 10) / 10)}/${fmt(targetH)} h`;
+        const heat = hasHeater && heaterEngaged() ? " · chauffage" : "";
         if (ctx.state.get("override") === true) {
           setIfChanged("summary", `Filtration ${prog} · dérogation`);
         } else if (desiredState(now) === "ON") {
-          setIfChanged("summary", `Filtration ${prog} · ${currentReason(now)}`);
+          setIfChanged("summary", `Filtration ${prog} · ${currentReason(now)}${heat}`);
         } else if (targetH > 0 && runH >= targetH) {
-          setIfChanged("summary", `Filtration ${fmt(targetH)} h · cible atteinte`);
+          setIfChanged("summary", `Filtration ${fmt(targetH)} h · cible atteinte${heat}`);
         } else {
           setIfChanged("summary", `Filtration ${prog} · en attente`);
         }
@@ -917,6 +1221,8 @@ export function createRecipe(): RecipeDefinition {
           // edges to clear it); schedule mode keeps its documented contract of
           // holding the dérogation until the next configured window edge.
           if (ctx.state.get("override") === true) ctx.state.set("override", false);
+          // A manual setpoint change stands until the filtration-day rollover.
+          if (ctx.state.get("heaterOverride") === true) ctx.state.set("heaterOverride", false);
           const count = num(ctx.state.get("tempCountToday"));
           if (count > 0) {
             ctx.state.set(
@@ -1011,7 +1317,10 @@ export function createRecipe(): RecipeDefinition {
         setTimeout(() => {
           tickScheduled = false;
           try {
-            if (!stopped) reconcile("surplus", false);
+            if (!stopped) {
+              reconcile("surplus", false);
+              reconcileHeater("surplus");
+            }
           } catch (err) {
             ctx.logger.error({ err }, "pool-pump: surplus tick failed");
           }
@@ -1029,6 +1338,8 @@ export function createRecipe(): RecipeDefinition {
           rolloverIfNeeded(now);
           account(now);
           manageClaim();
+          manageHeaterClaim();
+          reconcileHeater("cycle");
           updateTargetDisplay();
           updateSummary(now);
           // Auto mode: drive transitions from the 30 s tick so HC / daytime /
@@ -1131,11 +1442,35 @@ export function createRecipe(): RecipeDefinition {
           if (ev.equipmentId !== pumpId || ev.alias !== "state") return;
           try {
             reconcile("état pompe", true);
+            // Heater engagement is gated on the OBSERVED pump state: a pump
+            // start/stop report is exactly when the setpoint may need to move.
+            reconcileHeater("état pompe");
           } catch (err) {
             ctx.logger.error({ err }, "pool-pump: state-change handler failed");
           }
         }),
       );
+
+      if (hasHeater) {
+        unsubs.push(
+          ctx.eventBus.onType("equipment.order.executed", (event) => {
+            const ev = event as {
+              equipmentId?: string;
+              orderAlias?: string;
+              source?: { kind?: string };
+            };
+            if (ev.equipmentId !== heaterId || ev.orderAlias !== "setpoint") return;
+            if (ev.source?.kind === "recipe") return;
+            if (Date.now() - lastHeaterDispatch < OWN_ORDER_GRACE_MS) return;
+            if (ctx.state.get("heaterOverride") !== true) {
+              ctx.state.set("heaterOverride", true);
+              ctx.log(
+                `Consigne modifiée manuellement sur ${heaterName()}. Dérogation chauffage jusqu'au prochain jour de filtration.`,
+              );
+            }
+          }),
+        );
+      }
 
       unsubs.push(
         ctx.eventBus.onType("equipment.order.executed", (event) => {
@@ -1166,9 +1501,11 @@ export function createRecipe(): RecipeDefinition {
       if (hasTarget && ctx.state.get("targetHours") == null) computeTarget();
       account(new Date());
       manageClaim();
+      manageHeaterClaim();
       updateTargetDisplay();
       updateSummary(new Date());
       reconcile("démarrage", true);
+      reconcileHeater("démarrage");
       lastAutoDesired = desiredState(new Date());
 
       guardTimer = setInterval(() => {
@@ -1185,6 +1522,9 @@ export function createRecipe(): RecipeDefinition {
         hasTarget
           ? `Recette démarrée (mode auto) — pompe ${pumpName()} : cible eau/${refTemp}°C→${maxHours}h, plancher ${minHours}h, plancher jour ${daytimeMinHours}h` +
               (runOnSurplus ? `, surplus (tolérance ${toleratedImportW} W)` : "") +
+              (hasHeater
+                ? `, chauffage ${heaterName()} → ${heatingTargetTemp}°C sur surplus (repos ${heaterIdleSetpoint}°C, tolérance ${heaterToleratedImportW} W)`
+                : "") +
               (windows.length ? `, ${windows.length} créneau(x) forcé(s) [${labels}]` : "")
           : `Recette démarrée (planning) — pompe ${pumpName()}, ${windows.length} créneau(x) [${labels}]`,
       );
@@ -1206,21 +1546,38 @@ export function createRecipe(): RecipeDefinition {
             claim.release();
             claim = null;
           }
+          if (heaterClaim) {
+            heaterClaim.release();
+            heaterClaim = null;
+          }
+          heaterGranted = false;
 
           const wasRunning = ctx.state.get("status") === "running";
+          const heaterWasHot =
+            hasHeater &&
+            lastCommandedSetpoint !== null &&
+            lastCommandedSetpoint !== heaterIdleSetpoint;
           ctx.state.set("status", "idle");
           ctx.state.set("currentSlot", null);
+          if (hasHeater) ctx.state.set("heating", null);
 
-          if (wasRunning) {
+          if (wasRunning || heaterWasHot) {
             // Override: pump stays ON without the recipe to drive it, so we
             // shut it down on disable (explicit dérogation requested in
-            // spec 082).
-            sendOrder("OFF")
-              .catch((err: unknown) => {
-                const msg = err instanceof Error ? err.message : String(err);
-                ctx.log(`Erreur OFF (arrêt recette) ${pumpName()}: ${msg}`, "error");
-              });
-            ctx.log(`Recette arrêtée — pompe ${pumpName()} coupée (dérogation)`);
+            // spec 082). Same sequencing as dispatch(): setpoint down first,
+            // then the pump.
+            (async () => {
+              if (heaterWasHot) await dispatchHeaterSetpoint(heaterIdleSetpoint);
+              if (wasRunning) await sendOrder("OFF");
+            })().catch((err: unknown) => {
+              const msg = err instanceof Error ? err.message : String(err);
+              ctx.log(`Erreur OFF (arrêt recette) ${pumpName()}: ${msg}`, "error");
+            });
+            ctx.log(
+              wasRunning
+                ? `Recette arrêtée — pompe ${pumpName()} coupée (dérogation)`
+                : `Recette arrêtée — consigne PAC ${heaterName()} redescendue`,
+            );
           } else {
             ctx.log("Recette arrêtée");
           }
