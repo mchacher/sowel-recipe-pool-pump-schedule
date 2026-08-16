@@ -1084,3 +1084,403 @@ describe("smart filtration (v1.2.0, auto model)", () => {
     });
   });
 });
+
+// ============================================================
+// Surplus heating (v1.5.0)
+// ============================================================
+
+describe("surplus heating (v1.5.0)", () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  const SUN = { sunrise: "07:00", sunset: "20:00", isDaylight: true };
+  const TARIFF = {
+    configured: true,
+    offPeakToday: [
+      { start: "00:04", end: "05:34" },
+      { start: "14:34", end: "17:04" },
+    ],
+    isOffPeakNow: null,
+  };
+  // Auto mode, pump surplus off to isolate the heater claim. 20:30, past
+  // sunset, outside HC, deadline still slack → only a heater grant can run.
+  const HEAT = {
+    zone: "Z1",
+    pump: "P1",
+    waterTempSensor: "WT1",
+    runOnSurplus: false,
+    heater: "HP1",
+    heatingTargetTemp: 28,
+    heaterIdleSetpoint: 10,
+    heaterToleratedImportW: 0,
+  };
+  const T2030 = new Date("2026-08-06T20:30:00");
+
+  type ClaimReq = {
+    equipmentId: string;
+    watts?: number;
+    toleratedImportW?: number;
+    slack?: string;
+    note?: string;
+    onGranted: () => void;
+    onRevoked: (r: string) => void;
+  };
+
+  /** Multi-claim fake arbiter: one record per equipmentId. */
+  function makeArbiterMulti(opts?: { enabled?: boolean; denied?: string[] }) {
+    const recs = new Map<string, { status: string; req: ClaimReq }>();
+    const reqs: ClaimReq[] = [];
+    return {
+      energy: {
+        claimCapacity: (r: ClaimReq) => {
+          const denied = opts?.denied?.includes(r.equipmentId) ?? false;
+          const rec = { status: denied ? "denied" : "pending", req: r };
+          recs.set(r.equipmentId, rec);
+          reqs.push(r);
+          return {
+            id: r.equipmentId,
+            status: () => rec.status,
+            deniedReason: denied ? "not-profiled" : undefined,
+            release: () => {
+              rec.status = "released";
+            },
+          };
+        },
+        getCapacityState: () => ({
+          enabled: opts?.enabled ?? true,
+          availableSurplusW: 1500,
+          grants: [],
+        }),
+      },
+      reqs,
+      active: (eq: string) => {
+        const r = recs.get(eq);
+        return !!r && (r.status === "pending" || r.status === "granted");
+      },
+      grant: (eq: string) => {
+        const r = recs.get(eq);
+        if (r && r.status === "pending") {
+          r.status = "granted";
+          r.req.onGranted();
+        }
+      },
+      revoke: (eq: string) => {
+        const r = recs.get(eq);
+        if (r && r.status === "granted") {
+          r.status = "pending";
+          r.req.onRevoked("surplus-deficit");
+        }
+      },
+    };
+  }
+
+  /** buildCtx + a heater HP1 exposing a setpoint binding that follows orders. */
+  function buildHeatCtx(
+    opts: Parameters<typeof buildCtx>[0] & {
+      initialSetpoint?: number;
+      profiles?: Record<string, number>;
+    } = {},
+  ) {
+    const base = buildCtx(opts);
+    let heaterSetpoint: unknown = opts.initialSetpoint ?? 10;
+    const em = base.ctx.equipmentManager as {
+      getById: (id: string) => unknown;
+      getDataBindingsWithValues: (id: string) => Array<{ alias: string; value: unknown }>;
+    };
+    const origBindings = em.getDataBindingsWithValues.bind(em);
+    em.getDataBindingsWithValues = (id: string) =>
+      id === "HP1" ? [{ alias: "setpoint", value: heaterSetpoint }] : origBindings(id);
+    if (opts.profiles) {
+      em.getById = (id: string) => ({
+        id,
+        name: id,
+        type: "x",
+        ...(opts.profiles![id]
+          ? { energyProfile: { nominalPowerW: opts.profiles![id] } }
+          : {}),
+      });
+    }
+    const origDispatch = base.ctx.dispatchOrder.bind(base.ctx);
+    (base.ctx as { dispatchOrder: unknown }).dispatchOrder = async (
+      e: string,
+      a: string,
+      v: unknown,
+    ) => {
+      if (e === "HP1" && a === "setpoint") heaterSetpoint = v;
+      return origDispatch(e, a, v);
+    };
+    return { ...base, getSetpoint: () => heaterSetpoint };
+  }
+
+  const setpointCalls = (calls: OrderCall[]) =>
+    calls.filter((c) => c.equipmentId === "HP1" && c.alias === "setpoint");
+
+  it("validate: a heater requires a water temperature sensor", () => {
+    const recipe = createRecipe();
+    const { ctx } = buildCtx();
+    expect(() =>
+      recipe.validate({ zone: "Z1", pump: "P1", heater: "HP1" }, ctx as never),
+    ).toThrow(/water temperature sensor/);
+  });
+
+  it("validate: the heating target must be above the idle setpoint", () => {
+    const recipe = createRecipe();
+    const { ctx } = buildCtx();
+    expect(() =>
+      recipe.validate(
+        { ...HEAT, heatingTargetTemp: 12, heaterIdleSetpoint: 15 },
+        ctx as never,
+      ),
+    ).toThrow(/above the idle setpoint/);
+  });
+
+  it("claims for the heater with slack high and zero tolerated import; pump claim stays off", () => {
+    vi.setSystemTime(T2030);
+    const arb = makeArbiterMulti();
+    const { ctx } = buildHeatCtx({ waterTemp: 20, energy: arb.energy, sunlight: SUN, tariff: TARIFF });
+    const handle = createRecipe().createInstance(HEAT, ctx as never);
+    expect(arb.active("HP1")).toBe(true);
+    expect(arb.active("P1")).toBe(false); // runOnSurplus false
+    const req = arb.reqs.find((r) => r.equipmentId === "HP1")!;
+    expect(req.slack).toBe("high");
+    expect(req.toleratedImportW).toBe(0);
+    expect(req.watts).toBeUndefined(); // no energy profiles exposed
+    handle.stop();
+  });
+
+  it("declares pump + heater watts when both energy profiles are known", () => {
+    vi.setSystemTime(T2030);
+    const arb = makeArbiterMulti();
+    const { ctx } = buildHeatCtx({
+      waterTemp: 20,
+      energy: arb.energy,
+      sunlight: SUN,
+      tariff: TARIFF,
+      profiles: { P1: 600, HP1: 2000 },
+    });
+    const handle = createRecipe().createInstance(HEAT, ctx as never);
+    const req = arb.reqs.find((r) => r.equipmentId === "HP1")!;
+    expect(req.watts).toBe(2600); // engaging heating may have to start the pump too
+    handle.stop();
+  });
+
+  it("grant → pump ON first, then setpoint raised to the target; startup keeps it idle", async () => {
+    vi.setSystemTime(T2030);
+    const arb = makeArbiterMulti();
+    const { ctx, orderCalls } = buildHeatCtx({
+      waterTemp: 20,
+      energy: arb.energy,
+      sunlight: SUN,
+      tariff: TARIFF,
+    });
+    const handle = createRecipe().createInstance(HEAT, ctx as never);
+    // Startup: no grant, binding already at idle (seeded) → nothing to send.
+    expect(setpointCalls(orderCalls)).toHaveLength(0);
+    expect(orderCalls.filter((c) => c.alias === "state" && c.value === "ON")).toHaveLength(0);
+    arb.grant("HP1");
+    await vi.advanceTimersByTimeAsync(1);
+    const on = orderCalls.findIndex((c) => c.alias === "state" && c.value === "ON");
+    const hot = orderCalls.findIndex((c) => c.alias === "setpoint" && c.value === 28);
+    expect(on).toBeGreaterThan(-1);
+    expect(hot).toBeGreaterThan(on); // water flows before the heater is asked to heat
+    handle.stop();
+  });
+
+  it("revoke → setpoint lowered BEFORE the pump OFF", async () => {
+    vi.setSystemTime(T2030);
+    const arb = makeArbiterMulti();
+    const { ctx, orderCalls } = buildHeatCtx({
+      waterTemp: 20,
+      energy: arb.energy,
+      sunlight: SUN,
+      tariff: TARIFF,
+    });
+    const handle = createRecipe().createInstance(HEAT, ctx as never);
+    arb.grant("HP1");
+    await vi.advanceTimersByTimeAsync(1);
+    arb.revoke("HP1");
+    await vi.advanceTimersByTimeAsync(1);
+    const idle = orderCalls.map((c, i) => ({ ...c, i })).filter(
+      (c) => c.alias === "setpoint" && c.value === 10,
+    );
+    const off = orderCalls.map((c, i) => ({ ...c, i })).filter(
+      (c) => c.alias === "state" && c.value === "OFF",
+    );
+    expect(idle.length).toBeGreaterThan(0); // the revoke path
+    expect(off.length).toBeGreaterThan(0);
+    expect(idle[idle.length - 1].i).toBeLessThan(off[off.length - 1].i);
+    handle.stop();
+  });
+
+  it("water at target → claim released, setpoint idles, and 0.5 °C hysteresis re-engages", async () => {
+    vi.setSystemTime(T2030);
+    const arb = makeArbiterMulti();
+    const { ctx, setWaterTemp, getSetpoint } = buildHeatCtx({
+      waterTemp: 27,
+      energy: arb.energy,
+      sunlight: SUN,
+      tariff: TARIFF,
+    });
+    const handle = createRecipe().createInstance(HEAT, ctx as never);
+    arb.grant("HP1");
+    await vi.advanceTimersByTimeAsync(1);
+    expect(getSetpoint()).toBe(28);
+    setWaterTemp(28.1); // target reached
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(arb.active("HP1")).toBe(false);
+    expect(getSetpoint()).toBe(10);
+    setWaterTemp(27.8); // inside the hysteresis band → stays satisfied
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(arb.active("HP1")).toBe(false);
+    setWaterTemp(27.4); // below target - 0.5 → wanted again
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(arb.active("HP1")).toBe(true);
+    handle.stop();
+  });
+
+  it("manual setpoint change → dérogation until the filtration-day rollover", async () => {
+    vi.setSystemTime(T2030);
+    const arb = makeArbiterMulti();
+    const { ctx, state, emit } = buildHeatCtx({
+      waterTemp: 20,
+      energy: arb.energy,
+      sunlight: SUN,
+      tariff: TARIFF,
+    });
+    const handle = createRecipe().createInstance(HEAT, ctx as never);
+    await vi.advanceTimersByTimeAsync(6_000); // past the own-order grace
+    emit("equipment.order.executed", {
+      equipmentId: "HP1",
+      orderAlias: "setpoint",
+      source: { kind: "manual", userId: "u1" },
+    });
+    expect(state.get("heaterOverride")).toBe(true);
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(arb.active("HP1")).toBe(false); // claim released under dérogation
+    await vi.advanceTimersByTimeAsync(10 * 3600_000); // past the 06:00 boundary
+    expect(state.get("heaterOverride")).toBe(false);
+    expect(arb.active("HP1")).toBe(true); // heating resumes the next day
+    handle.stop();
+  });
+
+  it("denied not-profiled → a single explanatory warn, then keeps retrying quietly", async () => {
+    vi.setSystemTime(T2030);
+    const arb = makeArbiterMulti({ denied: ["HP1"] });
+    const { ctx, logLines } = buildHeatCtx({
+      waterTemp: 20,
+      energy: arb.energy,
+      sunlight: SUN,
+      tariff: TARIFF,
+    });
+    const handle = createRecipe().createInstance(HEAT, ctx as never);
+    await vi.advanceTimersByTimeAsync(120_000); // ticks inside the backoff window
+    expect(arb.reqs.filter((r) => r.equipmentId === "HP1")).toHaveLength(1); // no journal spam
+    await vi.advanceTimersByTimeAsync(16 * 60_000); // past the 15 min denied backoff
+    const warns = logLines.filter((l) => l.includes("profil énergie"));
+    expect(warns).toHaveLength(1);
+    expect(arb.reqs.filter((r) => r.equipmentId === "HP1").length).toBeGreaterThan(1);
+    handle.stop();
+  });
+
+  it("manual dérogation survives the pump OFF: the recipe never clobbers the user's setpoint", async () => {
+    vi.setSystemTime(T2030);
+    const arb = makeArbiterMulti();
+    const { ctx, state, emit, orderCalls, getSetpoint } = buildHeatCtx({
+      waterTemp: 20,
+      energy: arb.energy,
+      sunlight: SUN,
+      tariff: TARIFF,
+    });
+    const handle = createRecipe().createInstance(HEAT, ctx as never);
+    arb.grant("HP1");
+    await vi.advanceTimersByTimeAsync(1);
+    expect(getSetpoint()).toBe(28); // heating engaged
+    await vi.advanceTimersByTimeAsync(6_000); // past the own-order grace
+    emit("equipment.order.executed", {
+      equipmentId: "HP1",
+      orderAlias: "setpoint",
+      source: { kind: "manual", userId: "u1" },
+    });
+    expect(state.get("heaterOverride")).toBe(true);
+    const setpointsBefore = setpointCalls(orderCalls).length;
+    await vi.advanceTimersByTimeAsync(61_000); // claim released → pump transitions OFF
+    expect(orderCalls.some((c) => c.alias === "state" && c.value === "OFF")).toBe(true);
+    // The pre-OFF setpoint lowering must NOT fire under the dérogation.
+    expect(setpointCalls(orderCalls)).toHaveLength(setpointsBefore);
+    expect(getSetpoint()).toBe(28); // the user's value stands
+    handle.stop();
+  });
+
+  it("restart mid-heating: startup lowers the setpoint BEFORE the corrective pump OFF", () => {
+    vi.setSystemTime(T2030);
+    const arb = makeArbiterMulti();
+    const { ctx, state, orderCalls } = buildHeatCtx({
+      waterTemp: 20,
+      initialPumpState: "ON", // engine restarted while the pump was heating
+      initialSetpoint: 28,
+      energy: arb.energy,
+      sunlight: SUN,
+      tariff: TARIFF,
+    });
+    // Persisted state says the filtration target is already met → the startup
+    // reconcile wants the pump OFF immediately.
+    state.set("day", "2026-08-06");
+    state.set("runSecondsToday", 9 * 3600); // above the 8 h target (water 20)
+    const handle = createRecipe().createInstance(HEAT, ctx as never);
+    const idle = orderCalls.findIndex((c) => c.alias === "setpoint" && c.value === 10);
+    const off = orderCalls.findIndex((c) => c.alias === "state" && c.value === "OFF");
+    expect(idle).toBeGreaterThan(-1);
+    expect(off).toBeGreaterThan(-1);
+    expect(idle).toBeLessThan(off); // heater calmed before its water flow stops
+    handle.stop();
+  });
+
+  it("without a heater slot nothing changes: no HP1 claim, no setpoint order", async () => {
+    vi.setSystemTime(T2030);
+    const arb = makeArbiterMulti();
+    const { ctx, orderCalls } = buildHeatCtx({
+      waterTemp: 20,
+      energy: arb.energy,
+      sunlight: SUN,
+      tariff: TARIFF,
+    });
+    const handle = createRecipe().createInstance(
+      { zone: "Z1", pump: "P1", waterTempSensor: "WT1", runOnSurplus: false },
+      ctx as never,
+    );
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(arb.reqs).toHaveLength(0);
+    expect(setpointCalls(orderCalls)).toHaveLength(0);
+    handle.stop();
+  });
+
+  it("stop() while heating → setpoint lowered, then pump OFF", async () => {
+    vi.setSystemTime(T2030);
+    const arb = makeArbiterMulti();
+    const { ctx, orderCalls, getSetpoint } = buildHeatCtx({
+      waterTemp: 20,
+      energy: arb.energy,
+      sunlight: SUN,
+      tariff: TARIFF,
+    });
+    const handle = createRecipe().createInstance(HEAT, ctx as never);
+    arb.grant("HP1");
+    await vi.advanceTimersByTimeAsync(1);
+    expect(getSetpoint()).toBe(28);
+    handle.stop();
+    await vi.advanceTimersByTimeAsync(1);
+    expect(getSetpoint()).toBe(10);
+    const idleIdx = orderCalls.map((c, i) => ({ ...c, i })).filter(
+      (c) => c.alias === "setpoint" && c.value === 10,
+    );
+    const offIdx = orderCalls.map((c, i) => ({ ...c, i })).filter(
+      (c) => c.alias === "state" && c.value === "OFF",
+    );
+    expect(idleIdx[idleIdx.length - 1].i).toBeLessThan(offIdx[offIdx.length - 1].i);
+    expect(arb.active("HP1")).toBe(false);
+  });
+});
