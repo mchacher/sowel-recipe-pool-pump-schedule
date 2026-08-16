@@ -870,12 +870,12 @@ export function createRecipe(): RecipeDefinition {
 
       /**
        * Hold the heater claim while heating is wanted. The claim is separate
-       * from the pump's, slack "high" (first shed), and declares pump + heater
-       * watts together: engaging heating may have to START the pump, so the
-       * surplus must cover both to guarantee zero import at engagement.
-       * Deliberately conservative when the pump already runs (the claim then
-       * over-reserves by the pump's watts and heating engages a bit later):
-       * the stated goal is zero-import heating, not maximum capture.
+       * from the pump's, slack "high" (first shed), and declares ONLY the
+       * heater's own watts: the pump holds its own claim (manageClaim, wanted
+       * whenever heating needs water flow), so each load is attributed to
+       * itself on the timeline. Zero-import is preserved because the arbiter
+       * grants the heater's watts on top of the pump's already-granted draw,
+       * and the pump — higher priority — is served first and shed last.
        */
       function manageHeaterClaim(): void {
         if (!hasHeater) return;
@@ -907,13 +907,13 @@ export function createRecipe(): RecipeDefinition {
           };
           try {
             const heaterW = nominal(heaterId!);
-            const pumpW = nominal(pumpId);
             heaterClaim =
               ctx.helpers.energy.claimCapacity({
                 equipmentId: heaterId!,
-                ...(heaterW !== null && pumpW !== null
-                  ? { watts: heaterW + pumpW }
-                  : {}),
+                // Reserve only the heater's OWN watts — the pump holds its own
+                // claim (see manageClaim), so bundling would double-count and
+                // paint the pump "hors pilotage" in the arbiter timeline (#12).
+                ...(heaterW !== null ? { watts: heaterW } : {}),
                 // Tolerance now comes from the heater equipment's energyProfile (#14 / core #550).
                 slack: "high", // lowest urgency — served last, shed first
                 note: "pool heating on surplus",
@@ -1371,9 +1371,20 @@ export function createRecipe(): RecipeDefinition {
         lastAccountAt = nowMs;
       }
 
-      /** Hold a surplus claim while the pump still needs to run today. */
+      /**
+       * Hold a surplus claim in the PUMP's own name while it still needs to run
+       * today: for filtration (below the daily target) OR because a granted
+       * heater needs water flow. Claiming the pump's own watts here — rather
+       * than bundling them into the heater claim — is what makes the pump show
+       * as "accordé" on the arbiter timeline while heating instead of "hors
+       * pilotage": its draw is attributed to the load that actually runs it.
+       */
       function manageClaim(): void {
-        if (!runOnSurplus || !hasTarget) return;
+        const heatingWantsPump = hasHeater && heatingNeeded();
+        // Bail out only when the pump can neither want a claim nor has one to
+        // release — otherwise a heating-driven claim would leak once heating
+        // ends while runOnSurplus/target are off.
+        if ((!runOnSurplus || !hasTarget) && !heatingWantsPump && !claim) return;
         let enabled = false;
         try {
           enabled =
@@ -1383,7 +1394,9 @@ export function createRecipe(): RecipeDefinition {
           enabled = false;
         }
         const want =
-          enabled && belowTarget() && ctx.state.get("override") !== true;
+          enabled &&
+          ctx.state.get("override") !== true &&
+          ((runOnSurplus && hasTarget && belowTarget()) || heatingWantsPump);
         if (want && !claim && ctx.helpers.energy) {
           try {
             claim =

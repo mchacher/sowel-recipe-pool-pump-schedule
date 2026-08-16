@@ -1507,7 +1507,7 @@ describe("surplus heating (v1.5.0)", () => {
     ).toThrow(/above the idle setpoint/);
   });
 
-  it("claims for the heater with slack high and no recipe-level tolerance (profile drives it, #14); pump claim stays off", () => {
+  it("claims for the heater with slack high and no recipe-level tolerance (profile drives it, #14); pump also claims for the water flow", () => {
     vi.setSystemTime(T2030);
     const arb = makeArbiterMulti();
     const { ctx } = buildHeatCtx({
@@ -1518,7 +1518,9 @@ describe("surplus heating (v1.5.0)", () => {
     });
     const handle = createRecipe().createInstance(HEAT, ctx as never);
     expect(arb.active("HP1")).toBe(true);
-    expect(arb.active("P1")).toBe(false); // runOnSurplus false
+    // Even with runOnSurplus off, the pump claims in its OWN name because
+    // heating needs water flow — so the timeline attributes its draw to it.
+    expect(arb.active("P1")).toBe(true);
     const req = arb.reqs.find((r) => r.equipmentId === "HP1")!;
     expect(req.slack).toBe("high");
     // The claim no longer carries a tolerance; the arbiter resolves it from the
@@ -1528,7 +1530,7 @@ describe("surplus heating (v1.5.0)", () => {
     handle.stop();
   });
 
-  it("declares pump + heater watts when both energy profiles are known", () => {
+  it("each load declares only its own watts (no bundling)", () => {
     vi.setSystemTime(T2030);
     const arb = makeArbiterMulti();
     const { ctx } = buildHeatCtx({
@@ -1539,8 +1541,14 @@ describe("surplus heating (v1.5.0)", () => {
       profiles: { P1: 600, HP1: 2000 },
     });
     const handle = createRecipe().createInstance(HEAT, ctx as never);
-    const req = arb.reqs.find((r) => r.equipmentId === "HP1")!;
-    expect(req.watts).toBe(2600); // engaging heating may have to start the pump too
+    const heaterReq = arb.reqs.find((r) => r.equipmentId === "HP1")!;
+    const pumpReq = arb.reqs.find((r) => r.equipmentId === "P1")!;
+    expect(heaterReq.watts).toBe(2000); // heater's own nominal, NOT pump + heater
+    // The pump's own claim carries its own watts (or the arbiter's nominal
+    // fallback); the point is the 600 W is never double-counted on the heater.
+    expect(heaterReq.watts).not.toBe(2600);
+    expect(arb.active("P1")).toBe(true);
+    expect(pumpReq).toBeDefined();
     handle.stop();
   });
 
@@ -1621,6 +1629,28 @@ describe("surplus heating (v1.5.0)", () => {
     setWaterTemp(27.4); // below target - 0.5 → wanted again
     await vi.advanceTimersByTimeAsync(30_000);
     expect(arb.active("HP1")).toBe(true);
+    handle.stop();
+  });
+
+  it("pump claim tracks the heater: taken while heating, released when it stops, re-taken", async () => {
+    vi.setSystemTime(T2030);
+    const arb = makeArbiterMulti();
+    const { ctx, setWaterTemp } = buildHeatCtx({
+      waterTemp: 20,
+      energy: arb.energy,
+      sunlight: SUN,
+      tariff: TARIFF,
+    });
+    const handle = createRecipe().createInstance(HEAT, ctx as never);
+    // runOnSurplus is off, yet the pump claims in its own name because heating
+    // needs water flow — this is what keeps it green on the timeline.
+    expect(arb.active("P1")).toBe(true);
+    setWaterTemp(28.1); // target reached → heating no longer needed
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(arb.active("P1")).toBe(false); // the heating-driven claim is released, not leaked
+    setWaterTemp(27.4); // below target - 0.5 → heating wanted again
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(arb.active("P1")).toBe(true); // re-taken
     handle.stop();
   });
 
