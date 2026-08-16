@@ -1278,8 +1278,8 @@ describe("surplus heating (v1.5.0)", () => {
       tariff: TARIFF,
     });
     const handle = createRecipe().createInstance(HEAT, ctx as never);
-    // Startup: no grant → setpoint parked at idle, pump has no reason to run.
-    expect(setpointCalls(orderCalls).map((c) => c.value)).toEqual([10]);
+    // Startup: no grant, binding already at idle (seeded) → nothing to send.
+    expect(setpointCalls(orderCalls)).toHaveLength(0);
     expect(orderCalls.filter((c) => c.alias === "state" && c.value === "ON")).toHaveLength(0);
     arb.grant("HP1");
     await vi.advanceTimersByTimeAsync(1);
@@ -1310,7 +1310,7 @@ describe("surplus heating (v1.5.0)", () => {
     const off = orderCalls.map((c, i) => ({ ...c, i })).filter(
       (c) => c.alias === "state" && c.value === "OFF",
     );
-    expect(idle.length).toBeGreaterThan(1); // startup + the revoke path
+    expect(idle.length).toBeGreaterThan(0); // the revoke path
     expect(off.length).toBeGreaterThan(0);
     expect(idle[idle.length - 1].i).toBeLessThan(off[off.length - 1].i);
     handle.stop();
@@ -1377,10 +1377,65 @@ describe("surplus heating (v1.5.0)", () => {
       tariff: TARIFF,
     });
     const handle = createRecipe().createInstance(HEAT, ctx as never);
-    await vi.advanceTimersByTimeAsync(120_000); // several retry ticks
+    await vi.advanceTimersByTimeAsync(120_000); // ticks inside the backoff window
+    expect(arb.reqs.filter((r) => r.equipmentId === "HP1")).toHaveLength(1); // no journal spam
+    await vi.advanceTimersByTimeAsync(16 * 60_000); // past the 15 min denied backoff
     const warns = logLines.filter((l) => l.includes("profil énergie"));
     expect(warns).toHaveLength(1);
     expect(arb.reqs.filter((r) => r.equipmentId === "HP1").length).toBeGreaterThan(1);
+    handle.stop();
+  });
+
+  it("manual dérogation survives the pump OFF: the recipe never clobbers the user's setpoint", async () => {
+    vi.setSystemTime(T2030);
+    const arb = makeArbiterMulti();
+    const { ctx, state, emit, orderCalls, getSetpoint } = buildHeatCtx({
+      waterTemp: 20,
+      energy: arb.energy,
+      sunlight: SUN,
+      tariff: TARIFF,
+    });
+    const handle = createRecipe().createInstance(HEAT, ctx as never);
+    arb.grant("HP1");
+    await vi.advanceTimersByTimeAsync(1);
+    expect(getSetpoint()).toBe(28); // heating engaged
+    await vi.advanceTimersByTimeAsync(6_000); // past the own-order grace
+    emit("equipment.order.executed", {
+      equipmentId: "HP1",
+      orderAlias: "setpoint",
+      source: { kind: "manual", userId: "u1" },
+    });
+    expect(state.get("heaterOverride")).toBe(true);
+    const setpointsBefore = setpointCalls(orderCalls).length;
+    await vi.advanceTimersByTimeAsync(61_000); // claim released → pump transitions OFF
+    expect(orderCalls.some((c) => c.alias === "state" && c.value === "OFF")).toBe(true);
+    // The pre-OFF setpoint lowering must NOT fire under the dérogation.
+    expect(setpointCalls(orderCalls)).toHaveLength(setpointsBefore);
+    expect(getSetpoint()).toBe(28); // the user's value stands
+    handle.stop();
+  });
+
+  it("restart mid-heating: startup lowers the setpoint BEFORE the corrective pump OFF", () => {
+    vi.setSystemTime(T2030);
+    const arb = makeArbiterMulti();
+    const { ctx, state, orderCalls } = buildHeatCtx({
+      waterTemp: 20,
+      initialPumpState: "ON", // engine restarted while the pump was heating
+      initialSetpoint: 28,
+      energy: arb.energy,
+      sunlight: SUN,
+      tariff: TARIFF,
+    });
+    // Persisted state says the filtration target is already met → the startup
+    // reconcile wants the pump OFF immediately.
+    state.set("day", "2026-08-06");
+    state.set("runSecondsToday", 9 * 3600); // above the 8 h target (water 20)
+    const handle = createRecipe().createInstance(HEAT, ctx as never);
+    const idle = orderCalls.findIndex((c) => c.alias === "setpoint" && c.value === 10);
+    const off = orderCalls.findIndex((c) => c.alias === "state" && c.value === "OFF");
+    expect(idle).toBeGreaterThan(-1);
+    expect(off).toBeGreaterThan(-1);
+    expect(idle).toBeLessThan(off); // heater calmed before its water flow stops
     handle.stop();
   });
 

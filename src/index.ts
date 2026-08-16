@@ -291,6 +291,8 @@ const TICK_INTERVAL_MS = 30_000;
 const CORRECTION_COOLDOWN_MS = 60_000;
 /** Window after an own dispatch during which order events are considered ours. */
 const OWN_ORDER_GRACE_MS = 5_000;
+/** Backoff between heater claim retries after a denial (e.g. not-profiled). */
+const HEATER_DENIED_RETRY_MS = 15 * 60_000;
 
 function buildWindows(params: Record<string, unknown>): Window[] {
   const windows: Window[] = [];
@@ -728,6 +730,7 @@ export function createRecipe(): RecipeDefinition {
       let heaterClaim: CapacityHandle | null = null;
       let heaterGranted = false;
       let heaterDeniedLogged = false;
+      let lastHeaterDeniedAt = 0; // backoff so denied retries don't spam the arbiter journal
       let lastHeaterDispatch = 0;
       let lastHeaterCorrection = 0;
       let lastCommandedSetpoint: number | null = null; // what WE last sent, null before first send
@@ -745,10 +748,12 @@ export function createRecipe(): RecipeDefinition {
         try {
           // Hard sequencing rule: the heater setpoint is lowered BEFORE any
           // pump OFF this recipe sends — the heat pump must be told to stop
-          // heating before its water flow goes away.
+          // heating before its water flow goes away. Under a heater
+          // dérogation the user owns the setpoint: never clobber it here.
           if (
             value === "OFF" &&
             hasHeater &&
+            ctx.state.get("heaterOverride") !== true &&
             lastCommandedSetpoint !== null &&
             lastCommandedSetpoint !== heaterIdleSetpoint
           ) {
@@ -849,6 +854,9 @@ export function createRecipe(): RecipeDefinition {
        * from the pump's, slack "high" (first shed), and declares pump + heater
        * watts together: engaging heating may have to START the pump, so the
        * surplus must cover both to guarantee zero import at engagement.
+       * Deliberately conservative when the pump already runs (the claim then
+       * over-reserves by the pump's watts and heating engages a bit later):
+       * the stated goal is zero-import heating, not maximum capture.
        */
       function manageHeaterClaim(): void {
         if (!hasHeater) return;
@@ -864,6 +872,9 @@ export function createRecipe(): RecipeDefinition {
           ctx.state.get("override") !== true &&
           ctx.state.get("heaterOverride") !== true;
         if (want && !heaterClaim && ctx.helpers.energy) {
+          // Each denied claimCapacity() writes a row in the arbiter journal:
+          // retry sparsely, not on every 30 s tick, until the profile is set.
+          if (Date.now() - lastHeaterDeniedAt < HEATER_DENIED_RETRY_MS) return;
           const nominal = (id: string): number | null => {
             const eq = ctx.equipmentManager.getById(id) as {
               energyProfile?: { nominalPowerW?: number };
@@ -893,12 +904,13 @@ export function createRecipe(): RecipeDefinition {
                 },
               }) ?? null;
             if (heaterClaim && heaterClaim.status() === "denied") {
+              lastHeaterDeniedAt = Date.now();
               if (!heaterDeniedLogged) {
                 heaterDeniedLogged = true;
                 const why = heaterClaim.deniedReason ?? "inconnu";
                 ctx.log(
                   why === "not-profiled"
-                    ? `Chauffage refusé par l'arbitre : la PAC ${heaterName()} n'a pas de profil énergie. Renseignez son profil (puissance nominale, minOnS/minOffS) dans Équipements.`
+                    ? `Chauffage refusé par l'arbitre : la PAC ${heaterName()} n'a pas de profil énergie. Renseignez son profil (classe confort, puissance nominale, minOnS/minOffS) dans Équipements.`
                     : `Chauffage refusé par l'arbitre (${why})`,
                   "warn",
                 );
@@ -919,7 +931,10 @@ export function createRecipe(): RecipeDefinition {
             /* a broken handle must not break the recipe */
           }
           heaterClaim = null;
-          heaterGranted = false;
+          if (heaterGranted) {
+            heaterGranted = false;
+            scheduleTick(); // the pump may have been held ON by this grant only
+          }
         }
       }
 
@@ -944,10 +959,14 @@ export function createRecipe(): RecipeDefinition {
           void dispatchHeaterSetpoint(desired);
           return;
         }
+        // Drift guard: skip inside the own-order grace — right after we sent a
+        // setpoint the device binding is still the stale pre-order value, and
+        // correcting against it would double-send every transition.
         const actual = readHeaterSetpoint();
         if (
           actual !== null &&
           Math.abs(actual - desired) > 0.25 &&
+          Date.now() - lastHeaterDispatch >= OWN_ORDER_GRACE_MS &&
           Date.now() - lastHeaterCorrection >= CORRECTION_COOLDOWN_MS
         ) {
           lastHeaterCorrection = Date.now();
@@ -1501,11 +1520,16 @@ export function createRecipe(): RecipeDefinition {
       if (hasTarget && ctx.state.get("targetHours") == null) computeTarget();
       account(new Date());
       manageClaim();
+      // Seed the last-commanded setpoint from the device so a restart
+      // mid-heating still lowers the setpoint before any pump OFF below.
+      if (hasHeater) lastCommandedSetpoint = readHeaterSetpoint();
       manageHeaterClaim();
       updateTargetDisplay();
       updateSummary(new Date());
-      reconcile("démarrage", true);
+      // Heater first: if the pump must be corrected to OFF right at startup,
+      // the setpoint has to be parked at idle before that order goes out.
       reconcileHeater("démarrage");
+      reconcile("démarrage", true);
       lastAutoDesired = desiredState(new Date());
 
       guardTimer = setInterval(() => {
@@ -1555,6 +1579,7 @@ export function createRecipe(): RecipeDefinition {
           const wasRunning = ctx.state.get("status") === "running";
           const heaterWasHot =
             hasHeater &&
+            ctx.state.get("heaterOverride") !== true && // manual setpoint stands
             lastCommandedSetpoint !== null &&
             lastCommandedSetpoint !== heaterIdleSetpoint;
           ctx.state.set("status", "idle");
