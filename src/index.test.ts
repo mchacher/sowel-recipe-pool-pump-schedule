@@ -1507,7 +1507,7 @@ describe("surplus heating (v1.5.0)", () => {
     ).toThrow(/above the idle setpoint/);
   });
 
-  it("claims for the heater with slack high and no recipe-level tolerance (profile drives it, #14); pump also claims for the water flow", () => {
+  it("claims for the heater with slack high and no recipe-level tolerance (profile drives it, #14) once the pump is granted; the pump also claims for the water flow", async () => {
     vi.setSystemTime(T2030);
     const arb = makeArbiterMulti();
     const { ctx } = buildHeatCtx({
@@ -1517,10 +1517,13 @@ describe("surplus heating (v1.5.0)", () => {
       tariff: TARIFF,
     });
     const handle = createRecipe().createInstance(HEAT, ctx as never);
-    expect(arb.active("HP1")).toBe(true);
-    // Even with runOnSurplus off, the pump claims in its OWN name because
-    // heating needs water flow — so the timeline attributes its draw to it.
+    // The pump claims immediately in its OWN name (heating needs water flow);
+    // the heater only claims once the pump holds its own surplus grant (#564).
     expect(arb.active("P1")).toBe(true);
+    expect(arb.active("HP1")).toBe(false);
+    arb.grant("P1");
+    await vi.advanceTimersByTimeAsync(1); // the tick claims the heater on top
+    expect(arb.active("HP1")).toBe(true);
     const req = arb.reqs.find((r) => r.equipmentId === "HP1")!;
     expect(req.slack).toBe("high");
     // The claim no longer carries a tolerance; the arbiter resolves it from the
@@ -1530,7 +1533,7 @@ describe("surplus heating (v1.5.0)", () => {
     handle.stop();
   });
 
-  it("each load declares only its own watts (no bundling)", () => {
+  it("each load declares only its own watts (no bundling)", async () => {
     vi.setSystemTime(T2030);
     const arb = makeArbiterMulti();
     const { ctx } = buildHeatCtx({
@@ -1541,6 +1544,8 @@ describe("surplus heating (v1.5.0)", () => {
       profiles: { P1: 600, HP1: 2000 },
     });
     const handle = createRecipe().createInstance(HEAT, ctx as never);
+    arb.grant("P1"); // the heater only claims once the pump holds its grant (#564)
+    await vi.advanceTimersByTimeAsync(1);
     const heaterReq = arb.reqs.find((r) => r.equipmentId === "HP1")!;
     const pumpReq = arb.reqs.find((r) => r.equipmentId === "P1")!;
     expect(heaterReq.watts).toBe(2000); // heater's own nominal, NOT pump + heater
@@ -1567,6 +1572,10 @@ describe("surplus heating (v1.5.0)", () => {
     expect(
       orderCalls.filter((c) => c.alias === "state" && c.value === "ON"),
     ).toHaveLength(0);
+    // The pump is granted first; the heater claims on top. The pump only turns
+    // ON once the heater is granted too, then the setpoint is raised (#564).
+    arb.grant("P1");
+    await vi.advanceTimersByTimeAsync(1);
     arb.grant("HP1");
     await vi.advanceTimersByTimeAsync(1);
     const on = orderCalls.findIndex(
@@ -1590,6 +1599,8 @@ describe("surplus heating (v1.5.0)", () => {
       tariff: TARIFF,
     });
     const handle = createRecipe().createInstance(HEAT, ctx as never);
+    arb.grant("P1");
+    await vi.advanceTimersByTimeAsync(1);
     arb.grant("HP1");
     await vi.advanceTimersByTimeAsync(1);
     arb.revoke("HP1");
@@ -1606,6 +1617,37 @@ describe("surplus heating (v1.5.0)", () => {
     handle.stop();
   });
 
+  it("#564 — pump revoked ⇒ heater released and idled, even inside the heater's own minOn", async () => {
+    vi.setSystemTime(T2030);
+    const arb = makeArbiterMulti();
+    const { ctx, getSetpoint } = buildHeatCtx({
+      waterTemp: 20,
+      energy: arb.energy,
+      sunlight: SUN,
+      tariff: TARIFF,
+    });
+    const handle = createRecipe().createInstance(HEAT, ctx as never);
+    arb.grant("P1");
+    await vi.advanceTimersByTimeAsync(1);
+    arb.grant("HP1");
+    await vi.advanceTimersByTimeAsync(1);
+    expect(getSetpoint()).toBe(28); // heating engaged
+    expect(arb.active("HP1")).toBe(true);
+
+    // The arbiter sheds the PUMP (e.g. the heater's own claim is still shielded
+    // by its minOn). The PAC cannot circulate its own water: the recipe must
+    // release the heater and idle the setpoint rather than heat dry.
+    arb.revoke("P1");
+    await vi.advanceTimersByTimeAsync(1);
+    expect(arb.active("HP1")).toBe(false); // leaves "accordé" in the arbiter
+    expect(getSetpoint()).toBe(10);
+
+    // And it must not immediately re-claim while the pump holds no grant.
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(arb.active("HP1")).toBe(false);
+    handle.stop();
+  });
+
   it("water at target → claim released, setpoint idles, and 0.5 °C hysteresis re-engages", async () => {
     vi.setSystemTime(T2030);
     const arb = makeArbiterMulti();
@@ -1616,6 +1658,8 @@ describe("surplus heating (v1.5.0)", () => {
       tariff: TARIFF,
     });
     const handle = createRecipe().createInstance(HEAT, ctx as never);
+    arb.grant("P1");
+    await vi.advanceTimersByTimeAsync(1);
     arb.grant("HP1");
     await vi.advanceTimersByTimeAsync(1);
     expect(getSetpoint()).toBe(28);
@@ -1628,6 +1672,9 @@ describe("surplus heating (v1.5.0)", () => {
     expect(arb.active("HP1")).toBe(false);
     setWaterTemp(27.4); // below target - 0.5 → wanted again
     await vi.advanceTimersByTimeAsync(30_000);
+    // The pump re-claims; once it is granted again the heater claims on top (#564).
+    arb.grant("P1");
+    await vi.advanceTimersByTimeAsync(1);
     expect(arb.active("HP1")).toBe(true);
     handle.stop();
   });
@@ -1664,6 +1711,9 @@ describe("surplus heating (v1.5.0)", () => {
       tariff: TARIFF,
     });
     const handle = createRecipe().createInstance(HEAT, ctx as never);
+    arb.grant("P1"); // pump granted so the heater claims (#564)
+    await vi.advanceTimersByTimeAsync(1);
+    expect(arb.active("HP1")).toBe(true);
     await vi.advanceTimersByTimeAsync(6_000); // past the own-order grace
     emit("equipment.order.executed", {
       equipmentId: "HP1",
@@ -1675,7 +1725,7 @@ describe("surplus heating (v1.5.0)", () => {
     expect(arb.active("HP1")).toBe(false); // claim released under dérogation
     await vi.advanceTimersByTimeAsync(10 * 3600_000); // past the 06:00 boundary
     expect(state.get("heaterOverride")).toBe(false);
-    expect(arb.active("HP1")).toBe(true); // heating resumes the next day
+    expect(arb.active("HP1")).toBe(true); // heating resumes the next day (pump still granted)
     handle.stop();
   });
 
@@ -1689,6 +1739,7 @@ describe("surplus heating (v1.5.0)", () => {
       tariff: TARIFF,
     });
     const handle = createRecipe().createInstance(HEAT, ctx as never);
+    arb.grant("P1"); // pump granted so the heater attempts its (denied) claim (#564)
     await vi.advanceTimersByTimeAsync(120_000); // ticks inside the backoff window
     expect(arb.reqs.filter((r) => r.equipmentId === "HP1")).toHaveLength(1); // no journal spam
     await vi.advanceTimersByTimeAsync(16 * 60_000); // past the 15 min denied backoff
@@ -1710,6 +1761,8 @@ describe("surplus heating (v1.5.0)", () => {
       tariff: TARIFF,
     });
     const handle = createRecipe().createInstance(HEAT, ctx as never);
+    arb.grant("P1");
+    await vi.advanceTimersByTimeAsync(1);
     arb.grant("HP1");
     await vi.advanceTimersByTimeAsync(1);
     expect(getSetpoint()).toBe(28); // heating engaged
@@ -1788,6 +1841,8 @@ describe("surplus heating (v1.5.0)", () => {
       tariff: TARIFF,
     });
     const handle = createRecipe().createInstance(HEAT, ctx as never);
+    arb.grant("P1");
+    await vi.advanceTimersByTimeAsync(1);
     arb.grant("HP1");
     await vi.advanceTimersByTimeAsync(1);
     expect(getSetpoint()).toBe(28);

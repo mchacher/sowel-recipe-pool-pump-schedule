@@ -42,6 +42,13 @@
  * once the filtration target is met. The setpoint is always lowered before
  * any pump OFF the recipe sends. Heating never runs on off-peak or the
  * deadline catch-up: no surplus, no heating.
+ *
+ * The heater strictly depends on the pump's own surplus grant (#564): it only
+ * claims/heats while the pump is granted, and the instant the arbiter revokes
+ * the pump — even while the heater's own claim is still inside its minOn
+ * anti-short-cycle window — the recipe releases the heater and idles the
+ * setpoint. The PAC cannot circulate its own water, so pump revoked ⇒ PAC
+ * released (and shown "at rest" in the arbiter, not "accordé").
  */
 
 // ============================================================
@@ -860,6 +867,11 @@ export function createRecipe(): RecipeDefinition {
       function heaterEngaged(): boolean {
         return (
           hasHeater &&
+          // #564 — the PAC depends on the pump's own surplus grant. No pump
+          // grant means no water flow, so heating must not engage — and it
+          // disengages the instant the arbiter revokes the pump, even while the
+          // heater's own claim is still shielded by its minOn.
+          arbiterGranted &&
           heaterGranted &&
           heatingNeeded() &&
           readPumpState() === "ON" &&
@@ -889,6 +901,13 @@ export function createRecipe(): RecipeDefinition {
         }
         const want =
           enabled &&
+          // #564 — claim (and hold) the heater only while the pump holds its
+          // own surplus grant. This both orders the ensemble (pump served
+          // first, heater on top) and couples them: when the arbiter revokes
+          // the pump, arbiterGranted drops, want goes false, and the heater
+          // claim is released the same tick — so the PAC leaves "accordé"
+          // instead of heating dry until its own minOn window lapses.
+          arbiterGranted &&
           heatingNeeded() &&
           ctx.state.get("override") !== true &&
           ctx.state.get("heaterOverride") !== true;
@@ -1134,8 +1153,12 @@ export function createRecipe(): RecipeDefinition {
         if (activeWindow(now, windows) !== null) return "ON"; // optional forced windows
         // A granted heater claim holds the pump: heating implies water flow,
         // even once the filtration target is met (free energy, and the extra
-        // run time counts toward filtration anyway).
-        if (hasHeater && heaterGranted && heatingNeeded()) return "ON";
+        // run time counts toward filtration anyway). Gated on the pump's own
+        // grant too (#564): the PAC cannot run without the pump, so the moment
+        // the arbiter revokes the pump this rung stops holding it ON to feed a
+        // heater that can no longer heat.
+        if (hasHeater && arbiterGranted && heaterGranted && heatingNeeded())
+          return "ON";
         if (!hasTarget) return "OFF"; // schedule-only (v1.1.0)
         if (!belowTarget()) return "OFF"; // daily target reached → stop
         if (runOnSurplus && arbiterGranted) return "ON"; // 1. solar surplus (free/partial)
@@ -1150,7 +1173,7 @@ export function createRecipe(): RecipeDefinition {
       function currentReason(now: Date): string {
         const w = activeWindow(now, windows);
         if (w) return windowLabel(w);
-        if (hasHeater && heaterGranted && heatingNeeded())
+        if (hasHeater && arbiterGranted && heaterGranted && heatingNeeded())
           return "chauffage PAC (surplus)";
         if (runOnSurplus && arbiterGranted) return "surplus";
         if (inHcSlot(now)) return "heures creuses";
@@ -1413,6 +1436,16 @@ export function createRecipe(): RecipeDefinition {
                 onRevoked: (why: string) => {
                   arbiterGranted = false;
                   ctx.log(`Surplus retiré par l'arbitre (${why})${progress()}`);
+                  // #564 — the PAC cannot circulate its own water: losing the
+                  // pump means losing the heater too. scheduleTick's
+                  // manageHeaterClaim drops the heater claim (arbiterGranted is
+                  // now false) so the PAC leaves "accordé", and reconcileHeater
+                  // parks the setpoint at idle.
+                  if (hasHeater && heaterGranted) {
+                    ctx.log(
+                      `Chauffage PAC ${heaterName()} coupé : la pompe a perdu le surplus, la PAC ne peut pas tourner sans circulation${progress()}`,
+                    );
+                  }
                   scheduleTick();
                 },
               }) ?? null;
@@ -1440,6 +1473,11 @@ export function createRecipe(): RecipeDefinition {
           tickScheduled = false;
           try {
             if (!stopped) {
+              // Bring the claims in step with the grant/revoke that woke this
+              // tick before acting on them: a pump grant lets the heater claim
+              // on top, a pump revoke releases the heater the same tick (#564).
+              manageClaim();
+              manageHeaterClaim();
               reconcile("surplus", false);
               reconcileHeater("surplus");
             }
