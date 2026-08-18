@@ -72,6 +72,26 @@ a tick of each other. Each rung now **latches ON** once engaged and holds until
 its need is met (the daytime minimum, resp. the daily target) or its window ends
 (sunset / a new day). v1.4.1 fixed the night rung; v1.4.2 the daytime floor.
 
+### Solar-surplus heating (v1.5.0+)
+
+Setting a `heater` (a heat pump exposing a `setpoint` order) turns on optional
+pool heating driven by the surplus arbiter. The lever is the setpoint, never a
+power cut: on a grant the setpoint is raised to `heatingTargetTemp` (0.5 °C
+hysteresis); otherwise it is held at `heaterIdleSetpoint`. Heating strictly
+depends on the pump's own surplus grant (#564) — the heat pump must never run
+without water flow.
+
+**Strictly surplus-gated (v1.6.3, #18).** The arbiter shields a grant for its
+full `minOnS` (anti-short-cycle, meant for hard relays), which would keep the
+heat pump "granted" and heating through a real deficit. Because the heater lever
+is a soft setpoint and the heat pump self-protects, the recipe watches the
+signed grid balance and, once it has been importing continuously for ~3 min,
+**releases the heater itself** (dropping the setpoint to idle and leaving the
+arbiter grant) without waiting for the minOn shield to lapse. The pump is not
+affected — it stays free to fill its daily filtration slot on its own rungs. Set
+the heat pump's `energyProfile.toleratedImportW` to `0` so the arbiter's own
+accounting agrees that any import means "no surplus".
+
 ## Behaviour on stop
 
 Disabling or deleting a running instance overrides control and sends an
