@@ -315,6 +315,16 @@ const CORRECTION_COOLDOWN_MS = 60_000;
 const OWN_ORDER_GRACE_MS = 5_000;
 /** Backoff between heater claim retries after a denial (e.g. not-profiled). */
 const HEATER_DENIED_RETRY_MS = 15 * 60_000;
+/**
+ * How long the signed grid balance must stay negative (importing) before the
+ * heater is treated as no longer running on surplus (#18). The arbiter shields
+ * a heater grant for its full `minOnS` (anti-short-cycle, meant for hard
+ * relays), which keeps the PAC "accordé" and heating through a real deficit.
+ * The heater lever is a soft setpoint and the PAC self-protects, so we release
+ * it faster than the arbiter's own `releaseHoldS` (~10 min). Debounced so the
+ * user's very choppy surplus does not chatter the setpoint.
+ */
+const HEATER_SURPLUS_LOST_MS = 3 * 60_000;
 
 function buildWindows(params: Record<string, unknown>): Window[] {
   const windows: Window[] = [];
@@ -745,6 +755,11 @@ export function createRecipe(): RecipeDefinition {
       let lastHeaterDeniedAt = 0; // backoff so denied retries don't spam the arbiter journal
       let lastHeaterDispatch = 0;
       let lastHeaterCorrection = 0;
+      // #18 — timestamp since which the signed grid balance has been importing
+      // continuously; null when there is surplus (or it is unknown). Once it
+      // holds past HEATER_SURPLUS_LOST_MS the heater is released even though the
+      // arbiter's minOn would still shield the grant.
+      let heaterSurplusLostSince: number | null = null;
       let lastCommandedSetpoint: number | null = null; // what WE last sent, null before first send
 
       async function sendOrder(value: "ON" | "OFF"): Promise<void> {
@@ -859,10 +874,46 @@ export function createRecipe(): RecipeDefinition {
         }
       }
 
+      /** Signed grid surplus (W), &gt;0 exporting; null when the arbiter cannot
+       *  provide it (disabled / no production / helper missing). */
+      function readSurplusW(): number | null {
+        try {
+          const v = ctx.helpers.energy?.getCapacityState().availableSurplusW;
+          return typeof v === "number" && Number.isFinite(v) ? v : null;
+        } catch {
+          return null;
+        }
+      }
+
+      /**
+       * Update the surplus-loss watch (#18). Called once per tick. Importing
+       * (surplus &lt; 0) starts/holds the clock; any surplus, or unknown data,
+       * clears it — unknown must never force a release (the arbiter still
+       * governs when we cannot read the balance).
+       */
+      function updateSurplusWatch(): void {
+        const s = readSurplusW();
+        if (s !== null && s < 0) {
+          if (heaterSurplusLostSince === null) heaterSurplusLostSince = Date.now();
+        } else {
+          heaterSurplusLostSince = null;
+        }
+      }
+
+      /** True once the grid has imported continuously past the debounce (#18):
+       *  the heater is no longer running on surplus and must be released. */
+      function surplusGone(): boolean {
+        return (
+          heaterSurplusLostSince !== null &&
+          Date.now() - heaterSurplusLostSince >= HEATER_SURPLUS_LOST_MS
+        );
+      }
+
       /**
        * The heater is engaged (setpoint at target) only when ALL hold: the
-       * arbiter granted its claim, heating is still needed, and the pump is
-       * OBSERVED running — the heat pump must never work without water flow.
+       * arbiter granted its claim, heating is still needed, the pump is
+       * OBSERVED running — the heat pump must never work without water flow —
+       * and surplus has not been lost (#18).
        */
       function heaterEngaged(): boolean {
         return (
@@ -874,6 +925,9 @@ export function createRecipe(): RecipeDefinition {
           arbiterGranted &&
           heaterGranted &&
           heatingNeeded() &&
+          // #18 — strictly surplus-gated: drop the setpoint the moment surplus
+          // is gone, without waiting for the arbiter's minOn shield to lapse.
+          !surplusGone() &&
           readPumpState() === "ON" &&
           ctx.state.get("override") !== true &&
           ctx.state.get("heaterOverride") !== true
@@ -909,6 +963,9 @@ export function createRecipe(): RecipeDefinition {
           // instead of heating dry until its own minOn window lapses.
           arbiterGranted &&
           heatingNeeded() &&
+          // #18 — release the heater as soon as surplus is genuinely gone,
+          // rather than heating on grid power until the arbiter minOn lapses.
+          !surplusGone() &&
           ctx.state.get("override") !== true &&
           ctx.state.get("heaterOverride") !== true;
         if (want && !heaterClaim && ctx.helpers.energy) {
@@ -973,6 +1030,14 @@ export function createRecipe(): RecipeDefinition {
             heaterClaim = null;
           }
         } else if (!want && heaterClaim) {
+          // #18 — distinguish a surplus-loss release (pump still granted, heat
+          // still wanted, no override) so the user sees why the PAC stopped.
+          const dueToSurplus =
+            arbiterGranted &&
+            heatingNeeded() &&
+            surplusGone() &&
+            ctx.state.get("override") !== true &&
+            ctx.state.get("heaterOverride") !== true;
           try {
             heaterClaim.release();
           } catch {
@@ -981,6 +1046,10 @@ export function createRecipe(): RecipeDefinition {
           heaterClaim = null;
           if (heaterGranted) {
             heaterGranted = false;
+            if (dueToSurplus)
+              ctx.log(
+                `Chauffage PAC ${heaterName()} relâché : plus de surplus solaire${progress()}`,
+              );
             scheduleTick(); // the pump may have been held ON by this grant only
           }
         }
@@ -1403,7 +1472,12 @@ export function createRecipe(): RecipeDefinition {
        * pilotage": its draw is attributed to the load that actually runs it.
        */
       function manageClaim(): void {
-        const heatingWantsPump = hasHeater && heatingNeeded();
+        // #18 — a heater that has lost its surplus no longer needs water flow,
+        // so it must not keep the pump's surplus claim alive (which would leave
+        // the pump "accordé" on the timeline with no surplus). Filtration rungs
+        // (below-target / off-peak / floor) still run the pump on their own.
+        const heatingWantsPump =
+          hasHeater && heatingNeeded() && !surplusGone();
         // Bail out only when the pump can neither want a claim nor has one to
         // release — otherwise a heating-driven claim would leak once heating
         // ends while runOnSurplus/target are off.
@@ -1476,6 +1550,7 @@ export function createRecipe(): RecipeDefinition {
               // Bring the claims in step with the grant/revoke that woke this
               // tick before acting on them: a pump grant lets the heater claim
               // on top, a pump revoke releases the heater the same tick (#564).
+              updateSurplusWatch(); // #18 — refresh the surplus-loss clock first
               manageClaim();
               manageHeaterClaim();
               reconcile("surplus", false);
@@ -1497,6 +1572,7 @@ export function createRecipe(): RecipeDefinition {
           const now = new Date();
           rolloverIfNeeded(now);
           account(now);
+          updateSurplusWatch(); // #18 — refresh the surplus-loss clock first
           manageClaim();
           manageHeaterClaim();
           reconcileHeater("cycle");

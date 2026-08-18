@@ -1648,6 +1648,103 @@ describe("surplus heating (v1.5.0)", () => {
     handle.stop();
   });
 
+  /** Multi-claim fake arbiter whose signed surplus is settable (#18). */
+  function makeArbiterSurplus(initialSurplus: number) {
+    let surplus = initialSurplus;
+    const recs = new Map<string, { status: string; req: ClaimReq }>();
+    return {
+      energy: {
+        claimCapacity: (r: ClaimReq) => {
+          const rec = { status: "pending", req: r };
+          recs.set(r.equipmentId, rec);
+          return {
+            id: r.equipmentId,
+            status: () => rec.status,
+            deniedReason: undefined,
+            release: () => {
+              rec.status = "released";
+            },
+          };
+        },
+        getCapacityState: () => ({
+          enabled: true,
+          availableSurplusW: surplus,
+          grants: [],
+        }),
+      },
+      setSurplus: (w: number) => {
+        surplus = w;
+      },
+      active: (eq: string) => {
+        const r = recs.get(eq);
+        return !!r && (r.status === "pending" || r.status === "granted");
+      },
+      grant: (eq: string) => {
+        const r = recs.get(eq);
+        if (r && r.status === "pending") {
+          r.status = "granted";
+          r.req.onGranted();
+        }
+      },
+    };
+  }
+
+  it("#18 — heater released on a sustained deficit even while the arbiter would still shield the grant", async () => {
+    vi.setSystemTime(T2030);
+    const arb = makeArbiterSurplus(1500); // heating on surplus
+    const { ctx, getSetpoint } = buildHeatCtx({
+      waterTemp: 20,
+      energy: arb.energy,
+      sunlight: SUN,
+      tariff: TARIFF,
+    });
+    const handle = createRecipe().createInstance(HEAT, ctx as never);
+    arb.grant("P1");
+    await vi.advanceTimersByTimeAsync(1);
+    arb.grant("HP1");
+    await vi.advanceTimersByTimeAsync(1);
+    expect(getSetpoint()).toBe(28); // heating engaged
+    expect(arb.active("HP1")).toBe(true);
+
+    // Surplus is gone (the home is importing) but the arbiter NEVER revokes —
+    // it shields the grant for its full minOn. The recipe must release the
+    // heater itself once the deficit holds past the debounce.
+    arb.setSurplus(-700);
+    await vi.advanceTimersByTimeAsync(2 * 60_000); // < 3 min debounce → still on
+    expect(arb.active("HP1")).toBe(true);
+    expect(getSetpoint()).toBe(28);
+
+    await vi.advanceTimersByTimeAsync(2 * 60_000); // now past 3 min continuous
+    expect(arb.active("HP1")).toBe(false); // leaves "accordé"
+    expect(getSetpoint()).toBe(10); // setpoint idled
+    handle.stop();
+  });
+
+  it("#18 — a brief surplus dip does NOT release the heater (debounced)", async () => {
+    vi.setSystemTime(T2030);
+    const arb = makeArbiterSurplus(1500);
+    const { ctx, getSetpoint } = buildHeatCtx({
+      waterTemp: 20,
+      energy: arb.energy,
+      sunlight: SUN,
+      tariff: TARIFF,
+    });
+    const handle = createRecipe().createInstance(HEAT, ctx as never);
+    arb.grant("P1");
+    await vi.advanceTimersByTimeAsync(1);
+    arb.grant("HP1");
+    await vi.advanceTimersByTimeAsync(1);
+    expect(getSetpoint()).toBe(28);
+
+    arb.setSurplus(-500);
+    await vi.advanceTimersByTimeAsync(90_000); // 1.5 min deficit
+    arb.setSurplus(600); // surplus returns before the debounce elapses
+    await vi.advanceTimersByTimeAsync(5 * 60_000); // clock reset → stays engaged
+    expect(arb.active("HP1")).toBe(true);
+    expect(getSetpoint()).toBe(28);
+    handle.stop();
+  });
+
   it("water at target → claim released, setpoint idles, and 0.5 °C hysteresis re-engages", async () => {
     vi.setSystemTime(T2030);
     const arb = makeArbiterMulti();
