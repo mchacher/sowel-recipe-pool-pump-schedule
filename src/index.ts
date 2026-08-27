@@ -153,6 +153,10 @@ interface CapacityHandle {
   status(): "pending" | "granted" | "denied" | "released";
   deniedReason?: string;
   release(): void;
+  /** Spec 166 — declare whether the load needs current right now. Optional on
+   *  purpose: the method is absent on cores older than the spec, where the
+   *  call is skipped and the recipe behaves exactly as before. */
+  reportNeed?(need: boolean): void;
 }
 interface EnergyHelpers {
   claimCapacity(req: CapacityClaimReq): CapacityHandle;
@@ -736,6 +740,8 @@ export function createRecipe(): RecipeDefinition {
       let guardTimer: ReturnType<typeof setInterval> | null = null;
       let accountTimer: ReturnType<typeof setInterval> | null = null;
       let lastOwnDispatch = 0;
+      /** Spec 166 — one error line per instance, not one per tick. */
+      let reportNeedFailureLogged = false;
       let lastCorrection = 0;
       let lastAccountAt: number | null = null;
       let lastAutoDesired: "ON" | "OFF" | null = null; // last auto desired-state, for transition logging
@@ -1471,6 +1477,76 @@ export function createRecipe(): RecipeDefinition {
        * as "accordé" on the arbiter timeline while heating instead of "hors
        * pilotage": its draw is attributed to the load that actually runs it.
        */
+      /**
+       * Spec 166 — tell the arbiter whether each granted load needs current
+       * right now. Neither the pump nor the pool heat pump has a power meter of
+       * its own on a typical installation, so the arbiter has no measurement to
+       * read: without this the arbitration surface can only ever show them
+       * "accordé", however long they sit under a grant doing nothing.
+       *
+       * The signals are the ones the recipe already uses to drive the hardware,
+       * so a declaration cannot drift from what it actually does:
+       *
+       * - the heater reports `heaterEngaged()`, NOT `heatingNeeded()`. The two
+       *   differ exactly in the "attente pompe" window this recipe already
+       *   names in its own state: the heater claim is granted and its watts are
+       *   reserved, while the pump is not running yet, so the setpoint stays
+       *   parked at idle and the PAC draws nothing. That window is what this
+       *   declaration exists to describe;
+       * - the pump reports `pumpDrawing()`: its own ON/OFF decision, with the
+       *   observed state allowed to veto it. That decision can be OFF under a
+       *   held claim (a claim kept alive because heating wants water flow,
+       *   while the day's filtration target is already met and the heater's own
+       *   claim has not been granted yet), and the veto covers a pump that is
+       *   commanded ON but not actually running.
+       *
+       * The call is optional (`?.`): on a core without spec 166 the method is
+       * absent and the recipe keeps working unchanged.
+       */
+      function reportNeeds(now: Date): void {
+        // Separate try blocks: a core whose handle throws on one load must not
+        // cost the other its declaration. Logged once per instance, because a
+        // persistently throwing core would otherwise write 2880 error lines a
+        // day for a purely cosmetic feature.
+        try {
+          claim?.reportNeed?.(pumpDrawing(now));
+        } catch (err) {
+          logReportNeedFailure(err);
+        }
+        try {
+          heaterClaim?.reportNeed?.(heaterEngaged());
+        } catch (err) {
+          logReportNeedFailure(err);
+        }
+      }
+
+      function logReportNeedFailure(err: unknown): void {
+        if (reportNeedFailureLogged) return;
+        reportNeedFailureLogged = true;
+        ctx.logger.error({ err }, "pool-pump: reportNeed failed (logged once)");
+      }
+
+      /**
+       * Whether the pump is actually drawing, for the spec 166 declaration.
+       *
+       * Intent alone (`desiredState`) is not enough: a pump whose breaker is off
+       * or whose device is offline keeps being commanded ON, so the recipe would
+       * keep declaring "drawing" on a load reserving watts and consuming
+       * nothing, which is the exact case the declaration exists to expose.
+       *
+       * The observed state therefore vetoes the intent, but only outside the
+       * own-order grace: right after we send an ON the binding still carries the
+       * stale OFF, and the core journals a declaration transition with NO
+       * confirmation window, so reading it too early would journal a spurious
+       * draw-stopped/draw-started pair on every start.
+       */
+      function pumpDrawing(now: Date): boolean {
+        if (desiredState(now) !== "ON") return false;
+        const observed = readPumpState();
+        if (observed !== "OFF") return true;
+        return Date.now() - lastOwnDispatch < OWN_ORDER_GRACE_MS;
+      }
+
       function manageClaim(): void {
         // #18 — a heater that has lost its surplus no longer needs water flow,
         // so it must not keep the pump's surplus claim alive (which would leave
@@ -1555,6 +1631,13 @@ export function createRecipe(): RecipeDefinition {
               manageHeaterClaim();
               reconcile("surplus", false);
               reconcileHeater("surplus");
+              // Spec 166 — after reconcile, so the declaration describes the
+              // state the recipe has just driven the hardware into, not the one
+              // it is about to leave. This tick is also the one woken by a
+              // grant, which is where a fresh grant gets its first declaration
+              // (the arbiter drops the previous one when the claim leaves
+              // "granted").
+              reportNeeds(new Date());
             }
           } catch (err) {
             ctx.logger.error({ err }, "pool-pump: surplus tick failed");
@@ -1576,6 +1659,11 @@ export function createRecipe(): RecipeDefinition {
           manageClaim();
           manageHeaterClaim();
           reconcileHeater("cycle");
+          // Spec 166 — `desiredState` is deterministic within a tick, so the
+          // value declared here is the same one the auto block below would
+          // compute; the pump-state handler above is what makes an observed
+          // change land without waiting for this tick.
+          reportNeeds(now);
           updateTargetDisplay();
           updateSummary(now);
           // Auto mode: drive transitions from the 30 s tick so HC / daytime /
@@ -1687,6 +1775,12 @@ export function createRecipe(): RecipeDefinition {
             // Heater engagement is gated on the OBSERVED pump state: a pump
             // start/stop report is exactly when the setpoint may need to move.
             reconcileHeater("état pompe");
+            // Spec 166 — and it is exactly when `heaterEngaged()` flips, so the
+            // declaration is refreshed here too. Without it the arbiter shows
+            // the PAC "granted, consuming nothing" for up to a full 30 s tick
+            // after the pump has actually started, and green for as long after
+            // it has stopped.
+            reportNeeds(new Date());
           } catch (err) {
             ctx.logger.error({ err }, "pool-pump: state-change handler failed");
           }

@@ -1399,6 +1399,8 @@ describe("surplus heating (v1.5.0)", () => {
   function makeArbiterMulti(opts?: { enabled?: boolean; denied?: string[] }) {
     const recs = new Map<string, { status: string; req: ClaimReq }>();
     const reqs: ClaimReq[] = [];
+    /** Spec 166 — every `reportNeed` value pushed, per equipmentId. */
+    const needs = new Map<string, boolean[]>();
     return {
       energy: {
         claimCapacity: (r: ClaimReq) => {
@@ -1412,6 +1414,17 @@ describe("surplus heating (v1.5.0)", () => {
             deniedReason: denied ? "not-profiled" : undefined,
             release: () => {
               rec.status = "released";
+            },
+            // Spec 166 — a core carrying the spec exposes this. It records
+            // ONLY while the claim is granted, mirroring the real arbiter
+            // (`if (record.status !== "granted") return`): a fake that accepted
+            // a declaration on a pending claim would let a test assert a value
+            // the engine throws away.
+            reportNeed: (need: boolean) => {
+              if (rec.status !== "granted") return;
+              const list = needs.get(r.equipmentId) ?? [];
+              list.push(need);
+              needs.set(r.equipmentId, list);
             },
           };
         },
@@ -1440,6 +1453,12 @@ describe("surplus heating (v1.5.0)", () => {
           r.req.onRevoked("surplus-deficit");
         }
       },
+      /** Spec 166 — the last need declared for a load, or null if never. */
+      lastNeed: (eq: string) => {
+        const l = needs.get(eq);
+        return l && l.length ? l[l.length - 1] : null;
+      },
+      needCount: (eq: string) => (needs.get(eq) ?? []).length,
     };
   }
 
@@ -1956,5 +1975,115 @@ describe("surplus heating (v1.5.0)", () => {
       offIdx[offIdx.length - 1].i,
     );
     expect(arb.active("HP1")).toBe(false);
+  });
+  describe("reportNeed (spec 166)", () => {
+    it("declares the heater at rest in the 'attente pompe' window", async () => {
+      // Both claims are granted and the PAC's 1800 W are reserved, but the pump
+      // is not observed running, so `heaterEngaged()` is false, the setpoint
+      // stays parked at idle and the machine draws nothing. This is the window
+      // the recipe already names in its own state, and the one the declaration
+      // exists to describe: without it the arbitration surface shows solid
+      // green with nothing behind it.
+      vi.setSystemTime(T2030);
+      const arb = makeArbiterMulti();
+      const { ctx, state, setPumpState } = buildHeatCtx({
+        waterTemp: 20,
+        energy: arb.energy,
+        sunlight: SUN,
+        tariff: TARIFF,
+      });
+      const handle = createRecipe().createInstance(HEAT, ctx as never);
+      arb.grant("P1");
+      await vi.advanceTimersByTimeAsync(1);
+      arb.grant("HP1");
+      await vi.advanceTimersByTimeAsync(1);
+      expect(arb.lastNeed("HP1")).toBe(true);
+
+      // The pump stops being observed running (breaker, offline device, a stop
+      // that has not been ordered by us).
+      setPumpState("OFF");
+      await vi.advanceTimersByTimeAsync(31_000);
+
+      expect(state.get("heating")).toBe("attente pompe");
+      expect(arb.lastNeed("HP1")).toBe(false);
+      handle.stop();
+    });
+
+    it("declares the pump at rest when it is commanded ON but not running", async () => {
+      // Intent alone would keep saying "drawing" on a pump whose breaker is
+      // off, on a load that is reserving watts and consuming nothing. The
+      // observed state vetoes the intent once the own-order grace has passed.
+      vi.setSystemTime(T2030);
+      const arb = makeArbiterMulti();
+      const { ctx, setPumpState } = buildHeatCtx({
+        waterTemp: 20,
+        energy: arb.energy,
+        sunlight: SUN,
+        tariff: TARIFF,
+      });
+      const handle = createRecipe().createInstance(HEAT, ctx as never);
+      arb.grant("P1");
+      await vi.advanceTimersByTimeAsync(1);
+      arb.grant("HP1");
+      await vi.advanceTimersByTimeAsync(1);
+      expect(arb.lastNeed("P1")).toBe(true);
+
+      setPumpState("OFF");
+      await vi.advanceTimersByTimeAsync(31_000);
+
+      expect(arb.lastNeed("P1")).toBe(false);
+      handle.stop();
+    });
+
+    it("declares both drawing once the heater is granted and the pump runs", async () => {
+      vi.setSystemTime(T2030);
+      const arb = makeArbiterMulti();
+      const { ctx } = buildHeatCtx({
+        waterTemp: 20,
+        energy: arb.energy,
+        sunlight: SUN,
+        tariff: TARIFF,
+      });
+      const handle = createRecipe().createInstance(HEAT, ctx as never);
+
+      arb.grant("P1");
+      await vi.advanceTimersByTimeAsync(1);
+      arb.grant("HP1");
+      await vi.advanceTimersByTimeAsync(1);
+
+      expect(arb.lastNeed("HP1")).toBe(true);
+      expect(arb.lastNeed("P1")).toBe(true);
+      handle.stop();
+    });
+
+    it("releases the heater claim on a pump revoke rather than declaring it at rest", async () => {
+      // #564: losing the pump means losing water flow, so the PAC cannot heat.
+      // The recipe drops the claim entirely, which is better than holding it
+      // and declaring no need: no grant, no reservation standing against a
+      // lower-priority load, and the roster shows the PAC leaving "accordé"
+      // instead of lingering there in a paler green.
+      vi.setSystemTime(T2030);
+      const arb = makeArbiterMulti();
+      const { ctx } = buildHeatCtx({
+        waterTemp: 20,
+        energy: arb.energy,
+        sunlight: SUN,
+        tariff: TARIFF,
+      });
+      const handle = createRecipe().createInstance(HEAT, ctx as never);
+      arb.grant("P1");
+      await vi.advanceTimersByTimeAsync(1);
+      arb.grant("HP1");
+      await vi.advanceTimersByTimeAsync(1);
+      expect(arb.lastNeed("HP1")).toBe(true);
+      const before = arb.needCount("HP1");
+
+      arb.revoke("P1");
+      await vi.advanceTimersByTimeAsync(1);
+
+      expect(arb.active("HP1")).toBe(false);
+      expect(arb.needCount("HP1")).toBe(before);
+      handle.stop();
+    });
   });
 });
