@@ -92,6 +92,8 @@ affected — it stays free to fill its daily filtration slot on its own rungs. S
 the heat pump's `energyProfile.toleratedImportW` to `0` so the arbiter's own
 accounting agrees that any import means "no surplus".
 
+**Declares its loads' state to the arbiter (v1.7.0, spec 166).** Neither the pump nor the pool heat pump is individually metered on a typical installation, so the arbiter has no measurement to read and could only ever show them "accordé" under a grant. While a claim is granted the recipe now declares whether that load actually needs current: the heater reports whether heating is engaged (which is false in the "attente pompe" window, where its watts are reserved but the setpoint is still parked at idle), and the pump reports its own ON/OFF decision with the observed state allowed to veto it, so a pump commanded ON but not running reads as at rest rather than green. The call is optional, so on a core older than spec 166 nothing changes.
+
 ## Behaviour on stop
 
 Disabling or deleting a running instance overrides control and sends an
