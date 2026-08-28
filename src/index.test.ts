@@ -1670,10 +1670,12 @@ describe("surplus heating (v1.5.0)", () => {
   /** Multi-claim fake arbiter whose signed surplus is settable (#22). */
   function makeArbiterSurplus(initialSurplus: number) {
     let surplus = initialSurplus;
+    let claims = 0; // every claimCapacity() call, to pin "no re-claim" (#23)
     const recs = new Map<string, { status: string; req: ClaimReq }>();
     return {
       energy: {
         claimCapacity: (r: ClaimReq) => {
+          claims += 1;
           const rec = { status: "pending", req: r };
           recs.set(r.equipmentId, rec);
           return {
@@ -1694,6 +1696,7 @@ describe("surplus heating (v1.5.0)", () => {
       setSurplus: (w: number) => {
         surplus = w;
       },
+      claimCount: () => claims,
       active: (eq: string) => {
         const r = recs.get(eq);
         return !!r && (r.status === "pending" || r.status === "granted");
@@ -1705,10 +1708,14 @@ describe("surplus heating (v1.5.0)", () => {
           r.req.onGranted();
         }
       },
+      // Mirrors the real arbiter: a revoke returns the claim to `pending`
+      // (capacity-arbiter `revoke()`), it does NOT end it. Only a claimant's
+      // own `release()` is terminal. A fake that terminated on revoke would
+      // let a test assert an ending the engine never produces.
       revoke: (eq: string) => {
         const r = recs.get(eq);
         if (r && r.status === "granted") {
-          r.status = "released";
+          r.status = "pending";
           r.req.onRevoked("surplus-deficit");
         }
       },
@@ -1743,11 +1750,21 @@ describe("surplus heating (v1.5.0)", () => {
     expect(arb.active("HP1")).toBe(true);
     expect(getSetpoint()).toBe(28);
 
-    // The arbiter is the one that ends it.
+    // The arbiter is the one that ends it: the setpoint idles at once.
+    const claimsBefore = arb.claimCount();
     arb.revoke("HP1");
     await vi.advanceTimersByTimeAsync(1);
-    expect(arb.active("HP1")).toBe(false);
-    expect(getSetpoint()).toBe(10); // setpoint idled
+    expect(getSetpoint()).toBe(10);
+    // ...but the claim SURVIVES, back to pending, exactly as the engine leaves
+    // it. The recipe still wants surplus; it is simply not being served.
+    expect(arb.active("HP1")).toBe(true);
+
+    // And when the arbiter serves it again (its own `minOffS` having elapsed),
+    // heating resumes on the SAME claim — the recipe never re-claims.
+    arb.grant("HP1");
+    await vi.advanceTimersByTimeAsync(1);
+    expect(getSetpoint()).toBe(28);
+    expect(arb.claimCount()).toBe(claimsBefore);
     handle.stop();
   });
 
