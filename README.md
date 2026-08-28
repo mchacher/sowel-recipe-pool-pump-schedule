@@ -81,16 +81,34 @@ hysteresis); otherwise it is held at `heaterIdleSetpoint`. Heating strictly
 depends on the pump's own surplus grant (#564) — the heat pump must never run
 without water flow.
 
-**Strictly surplus-gated (v1.6.3, #18).** The arbiter shields a grant for its
-full `minOnS` (anti-short-cycle, meant for hard relays), which would keep the
-heat pump "granted" and heating through a real deficit. Because the heater lever
-is a soft setpoint and the heat pump self-protects, the recipe watches the
-signed grid balance and, once it has been importing continuously for ~3 min,
-**releases the heater itself** (dropping the setpoint to idle and leaving the
-arbiter grant) without waiting for the minOn shield to lapse. The pump is not
-affected — it stays free to fill its daily filtration slot on its own rungs. Set
-the heat pump's `energyProfile.toleratedImportW` to `0` so the arbiter's own
+**The arbiter owns the exit (v1.8.0, #22).** The recipe asks for capacity and
+holds its claim until the arbiter takes it back. It runs no surplus test of its
+own: while a claim is granted, whether the surplus still covers it is the
+arbiter's question.
+
+This reverses v1.6.3 (#18), which watched the signed grid balance and released
+the heater itself after ~3 min of import. The intent was sound — the arbiter
+shields a grant for its full `minOnS`, an anti-short-cycle meant for hard
+relays, and that shield kept the heat pump heating through a real deficit — but
+the remedy put the decision in the wrong place. It made the recipe a second,
+faster surplus authority, and on the reference installation the consequence was
+measurable: over a week the heat pump took **27 grants and never once got
+revoked**. Every grant ended in a recipe-side release, so the arbitration
+timeline showed a mute "libéré" where the household expected "surplus retiré",
+the short-cycle metric counted zero, and `minOffS` never armed — the load
+re-claimed within the minute, cycling the setpoint four times in an afternoon.
+
+The shield is **configuration, not code**. Set the heat pump's
+`energyProfile.minOnS` to `0`: the lever is a soft setpoint and the machine
+self-protects, so it needs no anti-short-cycle floor, and the arbiter is then
+free to revoke on its own `releaseHoldS` (10 min by default). Keep `minOffS` at
+a real value — with a genuine revoke it finally does its job and stops the load
+from re-claiming immediately. Set `toleratedImportW` to `0` so the arbiter's
 accounting agrees that any import means "no surplus".
+
+Leaving `minOnS` at a non-zero value is still safe; it simply means the heat pump
+keeps heating until the shield lapses, which is the behaviour the arbiter is
+documented to have.
 
 **Declares its loads' state to the arbiter (v1.7.0, spec 166).** Neither the pump nor the pool heat pump is individually metered on a typical installation, so the arbiter has no measurement to read and could only ever show them "accordé" under a grant. While a claim is granted the recipe now declares whether that load actually needs current: the heater reports whether heating is engaged (which is false in the "attente pompe" window, where its watts are reserved but the setpoint is still parked at idle), and the pump reports its own ON/OFF decision with the observed state allowed to veto it, so a pump commanded ON but not running reads as at rest rather than green. The call is optional, so on a core older than spec 166 nothing changes.
 
