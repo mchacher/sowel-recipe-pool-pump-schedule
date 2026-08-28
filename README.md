@@ -102,13 +102,19 @@ The shield is **configuration, not code**. Set the heat pump's
 `energyProfile.minOnS` to `0`: the lever is a soft setpoint and the machine
 self-protects, so it needs no anti-short-cycle floor, and the arbiter is then
 free to revoke on its own `releaseHoldS` (10 min by default). Keep `minOffS` at
-a real value — with a genuine revoke it finally does its job and stops the load
-from re-claiming immediately. Set `toleratedImportW` to `0` so the arbiter's
-accounting agrees that any import means "no surplus".
+a real value — only a revoke arms it, so with the exit back in the arbiter's
+hands it finally does its job: it holds off the **re-grant**, which is what
+stops the load from restarting a minute later. (The recipe itself never
+re-claims: a revoke returns its claim to pending and it waits there.) Set
+`toleratedImportW` to `0` so the arbiter's accounting agrees that any import
+means "no surplus".
 
-Leaving `minOnS` at a non-zero value is still safe; it simply means the heat pump
-keeps heating until the shield lapses, which is the behaviour the arbiter is
-documented to have.
+Leaving `minOnS` at a non-zero value is safe for the machine but not for the
+bill: the heat pump keeps drawing until the shield lapses **and then** until
+`releaseHoldS` elapses. On the `pool_heat_pump` defaults (`minOnS` 900 s,
+`minOffS` 600 s) that is up to 25 minutes of heat pump on grid import per
+deficit episode. That is the arbiter's documented behaviour, not a defect — it
+is simply why `0` is the right value for a soft-setpoint load.
 
 **Declares its loads' state to the arbiter (v1.7.0, spec 166).** Neither the pump nor the pool heat pump is individually metered on a typical installation, so the arbiter has no measurement to read and could only ever show them "accordé" under a grant. While a claim is granted the recipe now declares whether that load actually needs current: the heater reports whether heating is engaged (which is false in the "attente pompe" window, where its watts are reserved but the setpoint is still parked at idle), and the pump reports its own ON/OFF decision with the observed state allowed to veto it, so a pump commanded ON but not running reads as at rest rather than green. The call is optional, so on a core older than spec 166 nothing changes.
 
