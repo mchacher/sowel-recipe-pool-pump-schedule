@@ -62,6 +62,29 @@ with the rule that fired, for audit.
 Without an arbiter, tariff, or sunlight helper the corresponding rungs are
 skipped and the recipe still runs on schedule/target — nothing throws.
 
+### Manual dérogation (v1.8.2, #24)
+
+An order on the pump that the recipe did not send latches a **dérogation**: the
+recipe stands down until the next auto transition (a change of the ladder's
+output), or the 06:00 rollover.
+
+Two things are deliberately NOT a manual order: the recipe's own dispatches, and
+the core replaying a delivery it could not make. When an equipment or its
+integration comes back after an outage, the core re-dispatches the last order it
+could not deliver, stamped `{kind: "external", channel: "delivery-retry"}` — that
+is the recipe's own order coming back, not a human's, and it no longer latches a
+dérogation.
+
+On a real manual order the dérogation can be long: the claim is released, so
+`arbiterGranted` can no longer turn true, so the solar-surplus rung reads OFF and
+cannot itself produce the transition that would lift the dérogation. On a day
+with no off-peak window ahead it then holds until the 06:00 rollover. That is
+deliberate, and it matches the core: the arbiter suspends the same equipment for
+`overrideTtlS` (2 h by default) on that same order, so a claim taken meanwhile
+would only come back denied `override-active`. Standing down is the recipe
+agreeing with the arbiter that a human is driving. The bug worth fixing was the
+recipe latching a dérogation nobody asked for — see the replay rule above.
+
 ### Deferred-rung latches (v1.4.1, v1.4.2)
 
 The two deferred rungs — the **daytime floor** (rung 3) and the **night deadline
