@@ -683,6 +683,34 @@ describe("reconciliation", () => {
     handle.stop();
   });
 
+  it("a core delivery-retry replay is not a manual order (#24)", async () => {
+    // Incident 2026-08-29: a network outage left the recipe's own orders
+    // undelivered; when the equipment came back the core replayed the last one
+    // as {kind:"external", channel:"delivery-retry"}, long past the own-dispatch
+    // grace. The recipe read its own order as a human's and latched a
+    // dérogation, sitting out a whole afternoon of free surplus.
+    const recipe = createRecipe();
+    const { ctx, state, emit } = buildCtx();
+    const handle = recipe.createInstance(params, ctx as never);
+
+    await vi.advanceTimersByTimeAsync(6_000); // past the own-dispatch grace
+    emit("equipment.order.executed", {
+      equipmentId: "P1",
+      orderAlias: "state",
+      source: { kind: "external", channel: "delivery-retry" },
+    });
+    expect(state.get("override")).not.toBe(true);
+
+    // Any other external channel is still somebody else driving the pump.
+    emit("equipment.order.executed", {
+      equipmentId: "P1",
+      orderAlias: "state",
+      source: { kind: "external", channel: "mqtt" },
+    });
+    expect(state.get("override")).toBe(true);
+    handle.stop();
+  });
+
   it("sourceless order events right after an own dispatch do not set the dérogation", async () => {
     const recipe = createRecipe();
     const { ctx, state, emit } = buildCtx();
@@ -1323,6 +1351,38 @@ describe("smart filtration (v1.2.0, auto model)", () => {
       handle.stop();
     });
 
+    it("bare auto: a dérogation taken under an active grant still stands", async () => {
+      // The counterpart of #24: a GENUINE manual order must keep standing.
+      // The core arbiter suspends the equipment for `overrideTtlS` (2 h) on
+      // that same order, so any escape hatch that lifted the dérogation on
+      // surplus would only get its claim denied "override-active" — and undo
+      // the user's choice on the way. The ladder must simply not move.
+      vi.setSystemTime(new Date("2026-08-06T17:30:00"));
+      const arb = makeArbiter();
+      const { ctx, state, emit, setPumpState } = buildCtx({
+        waterTemp: 25,
+        energy: arb.energy,
+        sunlight: { sunrise: "07:00", sunset: "13:00", isDaylight: false },
+        tariff: TARIFF,
+      });
+      const handle = createRecipe().createInstance(
+        { ...AUTO, runOnSurplus: true },
+        ctx as never,
+      );
+      arb.grant();
+      await vi.advanceTimersByTimeAsync(6_000); // past the own-order grace
+      emit("equipment.order.executed", {
+        equipmentId: "P1",
+        orderAlias: "state",
+        source: { kind: "manual", userId: "u1" },
+      });
+      setPumpState("OFF");
+      expect(state.get("override")).toBe(true);
+      await vi.advanceTimersByTimeAsync(5 * 60_000);
+      expect(state.get("override")).toBe(true); // held: no ladder movement
+      handle.stop();
+    });
+
     it("bare auto: the 06:00 rollover lifts a lingering dérogation (backstop)", async () => {
       vi.setSystemTime(new Date("2026-08-06T23:00:00"));
       const { ctx, state, emit, setPumpState } = buildCtx({
@@ -1846,6 +1906,27 @@ describe("surplus heating (v1.5.0)", () => {
     await vi.advanceTimersByTimeAsync(10 * 3600_000); // past the 06:00 boundary
     expect(state.get("heaterOverride")).toBe(false);
     expect(arb.active("HP1")).toBe(true); // heating resumes the next day (pump still granted)
+    handle.stop();
+  });
+
+  it("a delivery-retry replay of a setpoint is not a manual change (#24)", async () => {
+    vi.setSystemTime(T2030);
+    const arb = makeArbiterMulti();
+    const { ctx, state, emit } = buildHeatCtx({
+      waterTemp: 20,
+      energy: arb.energy,
+      sunlight: SUN,
+      tariff: TARIFF,
+    });
+    const handle = createRecipe().createInstance(HEAT, ctx as never);
+    arb.grant("P1");
+    await vi.advanceTimersByTimeAsync(6_000); // past the own-order grace
+    emit("equipment.order.executed", {
+      equipmentId: "HP1",
+      orderAlias: "setpoint",
+      source: { kind: "external", channel: "delivery-retry" },
+    });
+    expect(state.get("heaterOverride")).not.toBe(true);
     handle.stop();
   });
 

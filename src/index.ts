@@ -317,6 +317,24 @@ const TICK_INTERVAL_MS = 30_000;
 const CORRECTION_COOLDOWN_MS = 60_000;
 /** Window after an own dispatch during which order events are considered ours. */
 const OWN_ORDER_GRACE_MS = 5_000;
+/**
+ * `OrderSource.channel` the core stamps on its own delivery retries
+ * (`order-confirmation-tracker.ts`): when an equipment or its integration comes
+ * back, the last unconfirmed order is re-dispatched as
+ * `{kind:"external", channel:"delivery-retry"}`.
+ *
+ * That replay carries OUR order, not a human's, and it lands long after the
+ * own-dispatch grace — so without this exemption a network outage ends with the
+ * recipe latching a dérogation against itself (#24).
+ */
+const RETRY_CHANNEL = "delivery-retry";
+
+/** True when an order event is the core replaying a delivery it could not make. */
+export function isDeliveryRetry(source: unknown): boolean {
+  const s = source as { kind?: string; channel?: string } | null | undefined;
+  return s?.kind === "external" && s.channel === RETRY_CHANNEL;
+}
+
 /** Backoff between heater claim retries after a denial (e.g. not-profiled). */
 const HEATER_DENIED_RETRY_MS = 15 * 60_000;
 
@@ -1732,11 +1750,12 @@ export function createRecipe(): RecipeDefinition {
             const ev = event as {
               equipmentId?: string;
               orderAlias?: string;
-              source?: { kind?: string };
+              source?: { kind?: string; channel?: string };
             };
             if (ev.equipmentId !== heaterId || ev.orderAlias !== "setpoint")
               return;
             if (ev.source?.kind === "recipe") return;
+            if (isDeliveryRetry(ev.source)) return;
             if (Date.now() - lastHeaterDispatch < OWN_ORDER_GRACE_MS) return;
             if (ctx.state.get("heaterOverride") !== true) {
               ctx.state.set("heaterOverride", true);
@@ -1753,10 +1772,11 @@ export function createRecipe(): RecipeDefinition {
           const ev = event as {
             equipmentId?: string;
             orderAlias?: string;
-            source?: { kind?: string };
+            source?: { kind?: string; channel?: string };
           };
           if (ev.equipmentId !== pumpId || ev.orderAlias !== "state") return;
           if (ev.source?.kind === "recipe") return;
+          if (isDeliveryRetry(ev.source)) return;
           if (Date.now() - lastOwnDispatch < OWN_ORDER_GRACE_MS) return;
           if (ctx.state.get("override") !== true) {
             ctx.state.set("override", true);
