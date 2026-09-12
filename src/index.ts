@@ -1578,8 +1578,11 @@ export function createRecipe(): RecipeDefinition {
               if (!pumpDeniedLogged) {
                 pumpDeniedLogged = true;
                 const why = claim.deniedReason ?? "inconnu";
+                const every = Math.round(DENIED_RETRY_MS / 60_000);
                 ctx.log(
-                  `Surplus refusé par l'arbitre pour ${pumpName()} (${why}) — nouvelle demande toutes les ${Math.round(DENIED_RETRY_MS / 60_000)} min`,
+                  why === "override-active"
+                    ? `Surplus refusé par l'arbitre pour ${pumpName()} : un ordre manuel l'a suspendue (2 h par défaut) — nouvelle demande toutes les ${every} min`
+                    : `Surplus refusé par l'arbitre pour ${pumpName()} (${why}) — nouvelle demande toutes les ${every} min`,
                   "warn",
                 );
               }

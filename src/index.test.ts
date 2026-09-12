@@ -2206,7 +2206,10 @@ describe("denied pump claim (#26)", () => {
     heaterIdleSetpoint: 10,
   };
 
-  /** Arbiter stub: denies the pump while `suspended`, accepts otherwise. */
+  /** Arbiter stub: denies the pump while `suspended`, accepts otherwise.
+   *  The real denied handle's `release()` is a no-op and its `status()` stays
+   *  "denied" for ever; the fake flips to "released" on purpose, so the test
+   *  can observe that the recipe called `release()` (a spy in disguise). */
   function makeSuspendingArbiter() {
     const calls: Array<{ equipmentId: string; status: () => string }> = [];
     let suspended = true;
@@ -2267,8 +2270,8 @@ describe("denied pump claim (#26)", () => {
     // logged once, not on every retry.
     await vi.advanceTimersByTimeAsync(2 * 3_600_000);
     const retriesWhileSuspended = arb.pump().length;
-    expect(retriesWhileSuspended).toBeGreaterThan(1);
-    expect(retriesWhileSuspended).toBeLessThanOrEqual(9); // 2 h / 15 min, +1
+    expect(retriesWhileSuspended).toBeGreaterThanOrEqual(8); // 2 h / 15 min
+    expect(retriesWhileSuspended).toBeLessThanOrEqual(9); // …+1 for the tick alignment
     expect(
       logLines.filter((l) => l.includes("Surplus refusé par l'arbitre")),
     ).toHaveLength(1);
