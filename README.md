@@ -62,6 +62,26 @@ with the rule that fired, for audit.
 Without an arbiter, tariff, or sunlight helper the corresponding rungs are
 skipped and the recipe still runs on schedule/target — nothing throws.
 
+### A denied claim is dropped and retried (v1.8.3, #26)
+
+The arbiter can answer a claim with a **denial** rather than a pending claim:
+`override-active` (a manual order suspended the equipment for `overrideTtlS`,
+2 h by default), `arbiter-disabled`, `equipment-already-claimed`,
+`not-profiled`. A denial is an answer, not a claim: the recipe releases the
+handle, logs the reason once, and asks again every 15 minutes until the
+arbiter accepts.
+
+Until v1.8.2 the pump kept a denied handle as if it were live, and only asked
+again once it no longer *wanted* to run. With a heater configured that never
+happens while the water is below the heating target, so a transient 2 h
+suspension became permanent. On the reference installation the sequence was a
+core update (the recipe restarts and cuts the pump), a manual ON nine seconds
+later (2 h suspension), and the off-peak transition lifting the dérogation
+inside those 2 h: the claim was denied, held, and the pump ran no surplus at
+all for four days while the site exported 10–15 kWh a day. Restarting the
+instance was the only way out. The heater claim already had this handling;
+the pump claim now has the same.
+
 ### Manual dérogation (v1.8.2, #24)
 
 An order on the pump that the recipe did not send latches a **dérogation**: the

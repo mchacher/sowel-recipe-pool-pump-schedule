@@ -335,8 +335,9 @@ export function isDeliveryRetry(source: unknown): boolean {
   return s?.kind === "external" && s.channel === RETRY_CHANNEL;
 }
 
-/** Backoff between heater claim retries after a denial (e.g. not-profiled). */
-const HEATER_DENIED_RETRY_MS = 15 * 60_000;
+/** Backoff between claim retries after a denial — for the heater (e.g.
+ *  not-profiled) and, since #26, for the pump too (e.g. override-active). */
+const DENIED_RETRY_MS = 15 * 60_000;
 
 function buildWindows(params: Record<string, unknown>): Window[] {
   const windows: Window[] = [];
@@ -760,6 +761,11 @@ export function createRecipe(): RecipeDefinition {
       // Surplus arbiter (spec 140) state.
       let claim: CapacityHandle | null = null;
       let arbiterGranted = false;
+      // #26 — a denied handle is an answer, not a claim: it is dropped and
+      // retried sparsely, so a transient denial (override-active lasts 2 h)
+      // cannot silently become a permanent one.
+      let pumpDeniedLogged = false;
+      let lastPumpDeniedAt = 0;
       let tickScheduled = false;
 
       // Heater claim state (v1.5.0) — a second, independent claim.
@@ -953,7 +959,7 @@ export function createRecipe(): RecipeDefinition {
         if (want && !heaterClaim && ctx.helpers.energy) {
           // Each denied claimCapacity() writes a row in the arbiter journal:
           // retry sparsely, not on every 30 s tick, until the profile is set.
-          if (Date.now() - lastHeaterDeniedAt < HEATER_DENIED_RETRY_MS) return;
+          if (Date.now() - lastHeaterDeniedAt < DENIED_RETRY_MS) return;
           const nominal = (id: string): number | null => {
             const eq = ctx.equipmentManager.getById(id) as {
               energyProfile?: { nominalPowerW?: number };
@@ -1530,6 +1536,9 @@ export function createRecipe(): RecipeDefinition {
           ctx.state.get("override") !== true &&
           ((runOnSurplus && hasTarget && belowTarget()) || heatingWantsPump);
         if (want && !claim && ctx.helpers.energy) {
+          // #26 — retry a denied claim sparsely, not on every 30 s tick: each
+          // denied claimCapacity() writes a row in the arbiter journal.
+          if (Date.now() - lastPumpDeniedAt < DENIED_RETRY_MS) return;
           try {
             claim =
               ctx.helpers.energy.claimCapacity({
@@ -1558,6 +1567,27 @@ export function createRecipe(): RecipeDefinition {
                   scheduleTick();
                 },
               }) ?? null;
+            if (claim && claim.status() === "denied") {
+              // #26 — the production incident: a claim denied "override-active"
+              // (2 h suspension after a manual order) was kept in `claim` as if
+              // it were live, so `want && !claim` never held again. With a
+              // heater configured `want` never drops (the water is always below
+              // the heating target), so the 2 h denial lasted until the instance
+              // was restarted — four days without a single surplus run.
+              lastPumpDeniedAt = Date.now();
+              if (!pumpDeniedLogged) {
+                pumpDeniedLogged = true;
+                const why = claim.deniedReason ?? "inconnu";
+                ctx.log(
+                  `Surplus refusé par l'arbitre pour ${pumpName()} (${why}) — nouvelle demande toutes les ${Math.round(DENIED_RETRY_MS / 60_000)} min`,
+                  "warn",
+                );
+              }
+              claim.release();
+              claim = null; // retry on a later tick (the denial is transient)
+            } else if (claim) {
+              pumpDeniedLogged = false;
+            }
           } catch (err) {
             ctx.logger.error({ err }, "pool-pump: claimCapacity failed");
             claim = null;
