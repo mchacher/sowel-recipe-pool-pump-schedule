@@ -2172,3 +2172,119 @@ describe("surplus heating (v1.5.0)", () => {
     });
   });
 });
+
+// ---------------------------------------------------------------------------
+// #26 — a denied pump claim is an answer, not a claim. Production 2026-09-08 →
+// 09-12: a claim denied "override-active" (2 h suspension after a manual
+// order) was kept as if live, and with a heater configured `want` never
+// drops, so the pump never re-claimed until the instance was restarted.
+// ---------------------------------------------------------------------------
+describe("denied pump claim (#26)", () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  const HC = {
+    configured: true,
+    offPeakToday: [
+      { start: "00:04", end: "05:34" },
+      { start: "14:34", end: "17:04" },
+    ],
+    isOffPeakNow: null,
+  };
+  const SUN = { sunrise: "07:10", sunset: "20:10", isDaylight: true };
+  const PARAMS = {
+    zone: "Z1",
+    pump: "P1",
+    waterTempSensor: "WT1",
+    runOnSurplus: true,
+    heater: "HP1",
+    heatingTargetTemp: 29,
+    heaterIdleSetpoint: 10,
+  };
+
+  /** Arbiter stub: denies the pump while `suspended`, accepts otherwise.
+   *  The real denied handle's `release()` is a no-op and its `status()` stays
+   *  "denied" for ever; the fake flips to "released" on purpose, so the test
+   *  can observe that the recipe called `release()` (a spy in disguise). */
+  function makeSuspendingArbiter() {
+    const calls: Array<{ equipmentId: string; status: () => string }> = [];
+    let suspended = true;
+    const energy = {
+      claimCapacity: (r: { equipmentId: string; onGranted: () => void }) => {
+        let status = r.equipmentId === "P1" && suspended ? "denied" : "pending";
+        const h = {
+          id: `${r.equipmentId}-${calls.length}`,
+          status: () => status,
+          deniedReason: status === "denied" ? "override-active" : undefined,
+          release: () => {
+            status = "released";
+          },
+          reportNeed: () => {},
+        };
+        calls.push({ equipmentId: r.equipmentId, status: h.status });
+        return h;
+      },
+      getCapacityState: () => ({
+        enabled: true,
+        availableSurplusW: 2000,
+        grants: [],
+      }),
+    };
+    const pump = () => calls.filter((c) => c.equipmentId === "P1");
+    return {
+      energy,
+      pump,
+      live: () =>
+        pump().filter(
+          (c) => c.status() === "pending" || c.status() === "granted",
+        ),
+      resume: () => {
+        suspended = false;
+      },
+    };
+  }
+
+  it("re-claims once the suspension lapses, instead of holding the denial for ever", async () => {
+    // 2026-09-08 14:25:55 — the recipe restarts 9 s after a manual ON that
+    // the arbiter answered with a 2 h suspension.
+    vi.setSystemTime(new Date("2026-09-08T14:25:55"));
+    const arb = makeSuspendingArbiter();
+    const { ctx, logLines } = buildCtx({
+      waterTemp: 27,
+      energy: arb.energy,
+      sunlight: SUN,
+      tariff: HC,
+    });
+    const handle = createRecipe().createInstance(PARAMS, ctx as never);
+    expect(arb.pump().length).toBe(1);
+    expect(arb.pump()[0].status()).toBe("released"); // dropped, not held
+    expect(
+      logLines.filter((l) => l.includes("Surplus refusé par l'arbitre")),
+    ).toHaveLength(1);
+
+    // Still suspended: the retry is sparse (15 min backoff), and the warn is
+    // logged once, not on every retry.
+    await vi.advanceTimersByTimeAsync(2 * 3_600_000);
+    const retriesWhileSuspended = arb.pump().length;
+    expect(retriesWhileSuspended).toBeGreaterThanOrEqual(8); // 2 h / 15 min
+    expect(retriesWhileSuspended).toBeLessThanOrEqual(9); // …+1 for the tick alignment
+    expect(
+      logLines.filter((l) => l.includes("Surplus refusé par l'arbitre")),
+    ).toHaveLength(1);
+
+    // The suspension lapses: the next retry lands a live claim.
+    arb.resume();
+    await vi.advanceTimersByTimeAsync(16 * 60_000);
+    expect(arb.live()).toHaveLength(1);
+
+    // …and the day after, the pump is still claiming (the incident's 4 days).
+    await vi.advanceTimersByTimeAsync(18 * 3_600_000);
+    expect(arb.live()).toHaveLength(1);
+    handle.stop();
+    expect(arb.live()).toHaveLength(0); // stop releases it
+  });
+});
