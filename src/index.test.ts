@@ -138,12 +138,18 @@ function makeArbiter(opts?: { enabled?: boolean; denied?: boolean }) {
   let status: "pending" | "granted" | "denied" | "released" = "pending";
   let req: { onGranted: () => void; onRevoked: (r: string) => void } | null =
     null;
+  /** Spec 166 — every `reportNeed` value pushed while the claim is granted,
+   *  mirroring the real arbiter (which throws the declaration away otherwise). */
+  const needs: boolean[] = [];
   const handle = {
     id: "claim-1",
     status: () => status,
     deniedReason: opts?.denied ? "not-profiled" : undefined,
     release: () => {
       status = "released";
+    },
+    reportNeed: (need: boolean) => {
+      if (status === "granted") needs.push(need);
     },
   };
   return {
@@ -175,6 +181,7 @@ function makeArbiter(opts?: { enabled?: boolean; denied?: boolean }) {
       }
     },
     claimed: () => req !== null && status !== "released",
+    needs,
   };
 }
 
@@ -558,34 +565,35 @@ describe("reconciliation", () => {
     handle.stop();
   });
 
-  it("periodic guard corrects silent drift", async () => {
+  it("periodic guard stands down on an uncommanded change (#28)", async () => {
+    // A wall switch emits no order event, only a state report. Until v1.9.0
+    // the guard read that as device drift and switched the pump back — on
+    // 2026-09-13, 14 s after it was cut at the wall, while the sand filter was
+    // being cleaned. A change the recipe did not cause is a person.
     const recipe = createRecipe();
-    const { ctx, orderCalls, setPumpState } = buildCtx();
+    const { ctx, orderCalls, state, setPumpState, logLines } = buildCtx();
     const handle = recipe.createInstance(params, ctx as never);
     expect(orderCalls.length).toBe(0);
 
-    setPumpState("ON"); // drift without any order event
+    setPumpState("ON"); // a hand on the wall switch
     await vi.advanceTimersByTimeAsync(5 * 60_000);
-    expect(orderCalls).toContainEqual({
-      equipmentId: "P1",
-      alias: "state",
-      value: "OFF",
-    });
+    expect(orderCalls.length).toBe(0);
+    expect(state.get("override")).toBe(true);
+    expect(logLines.some((l) => l.includes("sans ordre de la recette"))).toBe(
+      true,
+    );
     handle.stop();
   });
 
-  it("pump state report triggers an immediate reconcile", async () => {
+  it("pump state report stands down at once, without an order (#28)", async () => {
     const recipe = createRecipe();
-    const { ctx, orderCalls, setPumpState, emit } = buildCtx();
+    const { ctx, orderCalls, state, setPumpState, emit } = buildCtx();
     const handle = recipe.createInstance(params, ctx as never);
 
     setPumpState("ON");
     emit("equipment.data.changed", { equipmentId: "P1", alias: "state" });
-    expect(orderCalls).toContainEqual({
-      equipmentId: "P1",
-      alias: "state",
-      value: "OFF",
-    });
+    expect(orderCalls.length).toBe(0);
+    expect(state.get("override")).toBe(true);
     handle.stop();
   });
 
@@ -601,25 +609,36 @@ describe("reconciliation", () => {
     handle.stop();
   });
 
-  it("throttles corrections with a cooldown", async () => {
+  it("still nudges a device that ignores the recipe's own order, twice at most (#28)", async () => {
+    // The half of the corrective reconciliation that survives #28 (issue #1):
+    // a divergence INSIDE the own-order window is a device that did not apply
+    // what the recipe just sent. It is still corrected, throttled by the
+    // cooldown, and bounded — every correction refreshes the window, so an
+    // unbounded retry would hammer a dead pump once a minute for ever.
+    vi.setSystemTime(new Date("2026-04-19T12:00:00")); // inside the window
     const recipe = createRecipe();
-    const { ctx, orderCalls, setPumpState, emit } = buildCtx();
+    const { ctx, orderCalls, state, setPumpState, emit, logLines } = buildCtx({
+      initialPumpState: "OFF",
+    });
     const handle = recipe.createInstance(params, ctx as never);
+    expect(orderCalls.length).toBe(1); // startup correction: attempt 1
 
-    setPumpState("ON");
+    // The device never applies it and keeps reporting OFF.
+    setPumpState("OFF");
     emit("equipment.data.changed", { equipmentId: "P1", alias: "state" });
-    expect(orderCalls.length).toBe(1);
+    expect(orderCalls.length).toBe(1); // inside the 60 s cooldown
 
-    // Device fights back inside the cooldown window: no second order.
-    setPumpState("ON");
-    emit("equipment.data.changed", { equipmentId: "P1", alias: "state" });
-    expect(orderCalls.length).toBe(1);
-
-    // After the cooldown, the correction fires again.
     await vi.advanceTimersByTimeAsync(61_000);
-    setPumpState("ON");
+    setPumpState("OFF");
     emit("equipment.data.changed", { equipmentId: "P1", alias: "state" });
-    expect(orderCalls.length).toBe(2);
+    expect(orderCalls.length).toBe(2); // attempt 2, the last one
+
+    await vi.advanceTimersByTimeAsync(61_000);
+    setPumpState("OFF");
+    emit("equipment.data.changed", { equipmentId: "P1", alias: "state" });
+    expect(orderCalls.length).toBe(2); // budget spent: stands down
+    expect(state.get("override")).toBe(true);
+    expect(logLines.some((l) => l.includes("n'insiste plus"))).toBe(true);
     handle.stop();
   });
 
@@ -653,11 +672,13 @@ describe("reconciliation", () => {
       value: "ON",
     });
 
-    // Drift after the edge is corrected again.
+    // An uncommanded OFF after the edge is no longer argued with: the recipe
+    // stands down again rather than sending a second ON (#28).
     setPumpState("OFF");
     await vi.advanceTimersByTimeAsync(5 * 60_000);
     const onCalls = orderCalls.filter((c) => c.value === "ON");
-    expect(onCalls.length).toBe(2);
+    expect(onCalls.length).toBe(1);
+    expect(state.get("override")).toBe(true);
     handle.stop();
   });
 
@@ -673,13 +694,12 @@ describe("reconciliation", () => {
     });
     expect(state.get("override")).not.toBe(true);
 
+    // An order event of its own is not what latches a dérogation; an
+    // uncommanded state change is, and the two are independent (#28).
     setPumpState("ON");
     await vi.advanceTimersByTimeAsync(5 * 60_000);
-    expect(orderCalls).toContainEqual({
-      equipmentId: "P1",
-      alias: "state",
-      value: "OFF",
-    });
+    expect(orderCalls.length).toBe(0);
+    expect(state.get("override")).toBe(true);
     handle.stop();
   });
 
@@ -2286,5 +2306,323 @@ describe("denied pump claim (#26)", () => {
     expect(arb.live()).toHaveLength(1);
     handle.stop();
     expect(arb.live()).toHaveLength(0); // stop releases it
+  });
+});
+
+// ---------------------------------------------------------------------------
+// #28 — a state change the recipe did not command is a person. Production
+// 2026-09-13: the pump was cut at the Sonoff's button while the sand filter
+// was being cleaned, and the recipe switched it back ON 14 s later, twice.
+// ---------------------------------------------------------------------------
+describe("uncommanded change: stand down (#28)", () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  const TARIFF = {
+    configured: true,
+    offPeakToday: [
+      { start: "00:04", end: "05:34" },
+      { start: "14:34", end: "17:04" },
+    ],
+    isOffPeakNow: null,
+  };
+  const SUN = { sunrise: "07:10", sunset: "20:10", isDaylight: true };
+  const AUTO_SURPLUS = {
+    zone: "Z1",
+    pump: "P1",
+    waterTempSensor: "WT1",
+    runOnSurplus: true,
+  };
+
+  it("the 2026-09-13 morning, end to end", async () => {
+    vi.setSystemTime(new Date("2026-09-13T08:40:00"));
+    const arb = makeArbiter();
+    const { ctx, state, orderCalls, setPumpState, emit, logLines } = buildCtx({
+      waterTemp: 24,
+      energy: arb.energy,
+      sunlight: SUN,
+      tariff: TARIFF,
+    });
+    const handle = createRecipe().createInstance(AUTO_SURPLUS, ctx as never);
+    const ons = () => orderCalls.filter((c) => c.value === "ON").length;
+
+    // Surplus granted: the pump runs, under the recipe's control.
+    arb.grant();
+    await vi.advanceTimersByTimeAsync(100);
+    expect(ons()).toBe(1);
+    expect(state.get("override")).not.toBe(true);
+
+    // It runs for a while: on 2026-09-13 the recipe's ON was at 06:40 and the
+    // cut came at 08:34, far outside the own-order confirmation window.
+    await vi.advanceTimersByTimeAsync(30 * 60_000);
+
+    // The pump is cut at the wall button. No order event, only a state report.
+    setPumpState("OFF");
+    emit("equipment.data.changed", { equipmentId: "P1", alias: "state" });
+    await vi.advanceTimersByTimeAsync(100);
+    expect(state.get("override")).toBe(true);
+    expect(logLines.some((l) => l.includes("sans ordre de la recette"))).toBe(
+      true,
+    );
+
+    // Nothing switches it back on, for as long as the cleaning takes. This is
+    // the whole point: the old code sent ON 14 s in.
+    await vi.advanceTimersByTimeAsync(20 * 60_000);
+    expect(ons()).toBe(1);
+    // And a pump left OFF reserves no capacity: it must not be granted surplus
+    // and restarted under someone's hands.
+    expect(arb.claimed()).toBe(false);
+
+    // The pump is switched back on by hand.
+    setPumpState("ON");
+    emit("equipment.data.changed", { equipmentId: "P1", alias: "state" });
+    await vi.advanceTimersByTimeAsync(31_000);
+    // It draws again, so the claim comes back — that load is real and the
+    // arbiter has to account for it. Dropping it was the deadlock: no claim,
+    // no grant, so the ladder's output could never change and the dérogation
+    // held until the off-peak edge hours later.
+    expect(arb.claimed()).toBe(true);
+    // The dérogation still stands while the ladder does not want the pump on.
+    expect(state.get("override")).toBe(true);
+
+    // The grant arrives: the pump is running and the ladder wants it running,
+    // so there is nothing left to disagree about. Control resumes, and no
+    // order is sent — the pump is already in the right state.
+    arb.grant();
+    await vi.advanceTimersByTimeAsync(31_000);
+    expect(state.get("override")).toBe(false);
+    expect(ons()).toBe(1);
+    expect(logLines.some((l) => l.includes("Dérogation levée"))).toBe(true);
+    handle.stop();
+  });
+
+  it("agreement on OFF does not lift the dérogation", async () => {
+    // The counterpart: seconds after the pump is cut by hand the arbiter
+    // revokes the grant, so the ladder falls to OFF and agrees with the
+    // observed state. That agreement is not consent to restart it later.
+    vi.setSystemTime(new Date("2026-09-13T08:40:00"));
+    const arb = makeArbiter();
+    const { ctx, state, orderCalls, setPumpState, emit } = buildCtx({
+      waterTemp: 24,
+      energy: arb.energy,
+      sunlight: SUN,
+      tariff: TARIFF,
+    });
+    const handle = createRecipe().createInstance(AUTO_SURPLUS, ctx as never);
+    arb.grant();
+    await vi.advanceTimersByTimeAsync(100);
+    await vi.advanceTimersByTimeAsync(30 * 60_000); // past the own-order window
+
+    setPumpState("OFF");
+    emit("equipment.data.changed", { equipmentId: "P1", alias: "state" });
+    await vi.advanceTimersByTimeAsync(100);
+    expect(state.get("override")).toBe(true);
+
+    // Ladder and pump now agree on OFF, for an hour.
+    await vi.advanceTimersByTimeAsync(60 * 60_000);
+    expect(state.get("override")).toBe(true);
+    expect(orderCalls.filter((c) => c.value === "ON").length).toBe(1);
+    handle.stop();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// #28, review follow-ups: what must NOT happen once someone holds the pump.
+// ---------------------------------------------------------------------------
+describe("uncommanded change: the guarantees (#28)", () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  const TARIFF = {
+    configured: true,
+    offPeakToday: [
+      { start: "00:04", end: "05:34" },
+      { start: "14:34", end: "17:04" },
+    ],
+    isOffPeakNow: null,
+  };
+  const SUN = { sunrise: "07:10", sunset: "20:10", isDaylight: true };
+  const AUTO_SURPLUS = {
+    zone: "Z1",
+    pump: "P1",
+    waterTempSensor: "WT1",
+    runOnSurplus: true,
+  };
+
+  /** Grant the surplus and let the pump start, device acknowledging the order. */
+  async function startOnSurplus(t: string) {
+    vi.setSystemTime(new Date(t));
+    const arb = makeArbiter();
+    const ctxBits = buildCtx({
+      waterTemp: 24,
+      energy: arb.energy,
+      sunlight: SUN,
+      tariff: TARIFF,
+    });
+    const handle = createRecipe().createInstance(
+      AUTO_SURPLUS,
+      ctxBits.ctx as never,
+    );
+    arb.grant();
+    await vi.advanceTimersByTimeAsync(100);
+    // The device reports back that it applied the ON.
+    ctxBits.emit("equipment.data.changed", { equipmentId: "P1", alias: "state" });
+    return { arb, handle, ...ctxBits };
+  }
+
+  it("no rung edge restarts a pump somebody cut, not even off-peak", async () => {
+    // The review caught this: the dérogation used to end at the next ladder
+    // transition, so a pump cut at 09:10 came back on at the 14:34 off-peak
+    // edge — and on a day with no off-peak ahead, at the daytime floor, since a
+    // stopped pump stops accruing daytime seconds.
+    const { arb, handle, state, orderCalls, setPumpState, emit } =
+      await startOnSurplus("2026-09-13T09:10:00");
+    const ons = () => orderCalls.filter((c) => c.value === "ON").length;
+    expect(ons()).toBe(1);
+
+    await vi.advanceTimersByTimeAsync(30 * 60_000);
+    setPumpState("OFF"); // cut at the wall button
+    emit("equipment.data.changed", { equipmentId: "P1", alias: "state" });
+    await vi.advanceTimersByTimeAsync(100);
+    expect(state.get("override")).toBe(true);
+
+    // Across the off-peak edge, the daytime floor and sunset: nothing.
+    await vi.advanceTimersByTimeAsync(8 * 3_600_000);
+    expect(ons()).toBe(1);
+    expect(state.get("override")).toBe(true);
+    expect(arb.claimed()).toBe(false);
+    handle.stop();
+  });
+
+  it("an order the device acknowledged makes any later change a person's", async () => {
+    // The review's other hole: a cut 10 s after the recipe's own ON used to
+    // fall inside the own-order window and be argued with. A pump that reported
+    // the state we ordered has applied it; what moves it afterwards is a hand.
+    const { handle, state, orderCalls, setPumpState, emit } =
+      await startOnSurplus("2026-09-13T09:10:00");
+    expect(orderCalls.filter((c) => c.value === "ON").length).toBe(1);
+
+    await vi.advanceTimersByTimeAsync(10_000); // 10 s, far inside the 2 min window
+    setPumpState("OFF");
+    emit("equipment.data.changed", { equipmentId: "P1", alias: "state" });
+    await vi.advanceTimersByTimeAsync(5 * 60_000);
+    expect(orderCalls.filter((c) => c.value === "ON").length).toBe(1);
+    expect(state.get("override")).toBe(true);
+    handle.stop();
+  });
+
+  it("declares the pump's real draw to the arbiter under a dérogation", async () => {
+    // Spec 166: while a claim is granted the recipe says whether the load needs
+    // current. Under a dérogation the recipe is not driving, so the observed
+    // state is the only truthful answer — a pump running by hand under a held
+    // claim must not be declared at rest while drawing its nominal power.
+    const { arb, handle, state, setPumpState, emit } = await startOnSurplus(
+      "2026-09-13T09:10:00",
+    );
+    await vi.advanceTimersByTimeAsync(30 * 60_000);
+    expect(arb.needs.at(-1)).toBe(true); // running under the recipe's control
+
+    setPumpState("OFF"); // cut by hand
+    emit("equipment.data.changed", { equipmentId: "P1", alias: "state" });
+    await vi.advanceTimersByTimeAsync(100);
+    expect(state.get("override")).toBe(true);
+
+    // Switched back on by hand: the claim comes back and the declaration says
+    // the load draws, even though the recipe is not the one driving it.
+    setPumpState("ON");
+    emit("equipment.data.changed", { equipmentId: "P1", alias: "state" });
+    await vi.advanceTimersByTimeAsync(31_000);
+    arb.grant();
+    await vi.advanceTimersByTimeAsync(31_000);
+    expect(arb.needs.at(-1)).toBe(true);
+    handle.stop();
+  });
+
+  it("a new filtration day is the backstop for a pump left off", async () => {
+    // The pump is never restarted the same day, so the 06:00 rollover is what
+    // keeps a forgotten dérogation from being permanent.
+    const { handle, state, setPumpState, emit, logLines } =
+      await startOnSurplus("2026-09-13T05:00:00");
+    await vi.advanceTimersByTimeAsync(30 * 60_000);
+    setPumpState("OFF");
+    emit("equipment.data.changed", { equipmentId: "P1", alias: "state" });
+    await vi.advanceTimersByTimeAsync(100);
+    expect(state.get("override")).toBe(true);
+
+    await vi.advanceTimersByTimeAsync(90 * 60_000); // past 06:00
+    expect(state.get("override")).toBe(false);
+    expect(
+      logLines.some((l) => l.includes("nouveau jour de filtration")),
+    ).toBe(true);
+    handle.stop();
+  });
+
+  it("a redundant window-edge order is acknowledged on the spot", async () => {
+    // Review finding: a window edge re-asserts the desired state even when the
+    // device already holds it. No state change means no report, so the order
+    // stayed "never acknowledged" for the whole window and a cut 20 s later was
+    // argued with — the 2026-09-13 incident, reopened twice a day per window.
+    vi.setSystemTime(new Date("2026-04-19T09:59:00"));
+    const { ctx, orderCalls, state, setPumpState, emit } = buildCtx();
+    const handle = createRecipe().createInstance(
+      { zone: "Z1", pump: "P1", slot1_start: "10:00", slot1_end: "14:00" },
+      ctx as never,
+    );
+    expect(orderCalls.length).toBe(0);
+
+    // Someone starts the pump by hand a minute before the window opens.
+    setPumpState("ON");
+    emit("equipment.data.changed", { equipmentId: "P1", alias: "state" });
+    expect(state.get("override")).toBe(true);
+
+    // The 10:00 edge clears the dérogation by contract and re-asserts ON on a
+    // pump that is already running: a redundant order.
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(orderCalls.length).toBe(1);
+    expect(state.get("override")).not.toBe(true);
+
+    // Cut at the wall 20 s later. That order landed, so this is a person.
+    await vi.advanceTimersByTimeAsync(20_000);
+    setPumpState("OFF");
+    emit("equipment.data.changed", { equipmentId: "P1", alias: "state" });
+    await vi.advanceTimersByTimeAsync(6 * 60_000);
+    expect(orderCalls.length).toBe(1);
+    expect(state.get("override")).toBe(true);
+    handle.stop();
+  });
+
+  it("the periodic guard can still nudge a device that never answers", async () => {
+    // Review finding: the confirmation window was shorter than the 5 min guard,
+    // and a device that ignores an order emits no report — so nothing could ever
+    // reconcile inside the window. The recipe stood down at the first guard tick
+    // on a pump that had not moved, abandoning the filtration day.
+    vi.setSystemTime(new Date("2026-04-19T12:00:00")); // inside the window
+    const { ctx, orderCalls, state, setPumpState, logLines } = buildCtx({
+      initialPumpState: "OFF",
+    });
+    const handle = createRecipe().createInstance(
+      { zone: "Z1", pump: "P1", slot1_start: "10:00", slot1_end: "14:00" },
+      ctx as never,
+    );
+    expect(orderCalls.length).toBe(1); // startup nudge
+
+    // The device answers nothing and stays OFF, minute after minute.
+    for (let i = 0; i < 12; i++) {
+      setPumpState("OFF");
+      await vi.advanceTimersByTimeAsync(60_000);
+    }
+    // The guard got its second nudge in, then gave up — on the right grounds.
+    expect(orderCalls.length).toBe(2);
+    expect(state.get("override")).toBe(true);
+    expect(logLines.some((l) => l.includes("n'insiste plus"))).toBe(true);
+    handle.stop();
   });
 });

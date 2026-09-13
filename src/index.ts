@@ -317,6 +317,21 @@ const TICK_INTERVAL_MS = 30_000;
 const CORRECTION_COOLDOWN_MS = 60_000;
 /** Window after an own dispatch during which order events are considered ours. */
 const OWN_ORDER_GRACE_MS = 5_000;
+
+/** How long an order the device never acknowledged still authorises a
+ *  corrective one. It MUST outlast `RECONCILE_INTERVAL_MS`: a device that
+ *  ignores an order emits no state report, so the periodic guard is the only
+ *  thing that can notice — set shorter than the guard, the guard always lands
+ *  past the window and the recipe stands down on a pump that never moved,
+ *  abandoning the filtration day (#28 review). The real gate is acknowledgement,
+ *  not the clock: an order the pump applied makes any later change a person's,
+ *  however long ago it was sent. */
+const OWN_ORDER_CONFIRM_MS = RECONCILE_INTERVAL_MS + 60_000;
+
+/** Corrective orders sent for one unresolved divergence before the recipe
+ *  concludes that the pump is not listening — or that a hand is on it — and
+ *  stands down (#28). */
+const MAX_CORRECTION_ATTEMPTS = 2;
 /**
  * `OrderSource.channel` the core stamps on its own delivery retries
  * (`order-confirmation-tracker.ts`): when an equipment or its integration comes
@@ -752,6 +767,14 @@ export function createRecipe(): RecipeDefinition {
       /** Spec 166 — one error line per instance, not one per tick. */
       let reportNeedFailureLogged = false;
       let lastCorrection = 0;
+      let correctionAttempts = 0; // #28 — bounded fight, reset when it resolves
+      // #28 — the sharp signal. A pump that reported the state we ordered has
+      // applied it; anything that moves it afterwards is a hand, however soon.
+      // Only an order the device NEVER acknowledged can justify a corrective
+      // one. Without this, a cut 10 s after the recipe started the pump read as
+      // "the device did not apply it" and was argued with.
+      let lastSent: "ON" | "OFF" | null = null;
+      let lastSentLanded = false;
       let lastAccountAt: number | null = null;
       let lastAutoDesired: "ON" | "OFF" | null = null; // last auto desired-state, for transition logging
       let deadlineLatched = false; // once the deadline catch-up engages tonight, hold it (no threshold chatter)
@@ -779,6 +802,13 @@ export function createRecipe(): RecipeDefinition {
 
       async function sendOrder(value: "ON" | "OFF"): Promise<void> {
         lastOwnDispatch = Date.now();
+        lastSent = value;
+        // #28 — a re-assertion of a state the device ALREADY holds changes
+        // nothing, so no state report ever comes back and the order would stay
+        // "never acknowledged" for the whole confirmation window. A window edge
+        // re-asserts unconditionally, so schedule mode opened that hole twice a
+        // day per window: a cut 20 s after it reopened the original incident.
+        lastSentLanded = readPumpState() === value;
         if (ctx.dispatchOrder) {
           await ctx.dispatchOrder(pumpId, "state", value);
         } else {
@@ -1320,21 +1350,94 @@ export function createRecipe(): RecipeDefinition {
       /** Reconcile the observed state toward the desired one, sending only on
        *  mismatch. `corrective` = drift/guard (warn + cooldown); otherwise a
        *  normal transition (info, no cooldown). Stands down under a dérogation. */
-      function reconcile(reason: string, corrective: boolean): void {
+      /** #28 — hand the pump back to whoever is driving it: latch the
+       *  dérogation, say so once, and let scheduleTick release the claim (or
+       *  keep it if the pump is the one running) and park the heater. */
+      function standDown(message: string, level: "warn" | "info" = "warn"): void {
         if (ctx.state.get("override") === true) return;
+        ctx.state.set("override", true);
+        correctionAttempts = 0;
+        ctx.log(message, level);
+        // Release the claim (or keep it if the pump is the one running) and
+        // park the heater setpoint: no water flow, no heating.
+        scheduleTick();
+      }
+
+      function reconcile(
+        reason: string,
+        corrective: boolean,
+        startup = false,
+      ): void {
         const now = new Date();
+        const actual = readPumpState();
+        if (actual !== null && actual === lastSent) lastSentLanded = true;
+        if (ctx.state.get("override") === true) {
+          // #28 — dérogations are routine now, so the labels must not freeze on
+          // an intent the recipe is not applying: `status` follows the pump, so
+          // stop() sends its spec 082 OFF when the pump is actually running and
+          // stays quiet when it is not.
+          if (actual !== null) {
+            setIfChanged("status", actual === "ON" ? "running" : "idle");
+            setIfChanged("currentSlot", null);
+          }
+          return;
+        }
         const expected = desiredState(now);
         syncStateLabels(now, expected);
-        const actual = readPumpState();
-        if (actual === null || actual === expected) return;
+        if (actual === null) return;
+        if (actual === expected) {
+          correctionAttempts = 0; // the divergence resolved: fresh budget
+          return;
+        }
         if (corrective && hasTarget && expected !== lastAutoDesired) {
-          // The 5-min guard caught an auto transition before the 30 s tick did:
-          // log it as the normal rule-named transition, not a drift correction.
+          // The ladder itself moved and the 30 s tick has not acted on it yet:
+          // that is a transition, not a divergence somebody caused. Log it as
+          // the normal rule-named transition, not a drift correction. This is
+          // why `lastAutoDesired` is refreshed on every dispatch below — left
+          // stale for a tick, it made a hand-cut look like a ladder move and
+          // waved it straight past the stand-down gate (#28).
           lastAutoDesired = expected;
           ctx.log(logLine(expected, now, reason));
         } else if (corrective) {
+          // #28 — a divergence the recipe did not cause is a PERSON, not a
+          // drift, and a person is never argued with. The corrective order
+          // exists for one case only (issue #1): a device that did not apply an
+          // order the recipe sent, which means an order it never acknowledged,
+          // recently. A wall switch emits no order event, only a state report,
+          // so this is the only place that case can be caught. Latch the
+          // dérogation and send nothing: on 2026-09-13 the recipe switched the
+          // pump back on 14 s after it was cut at the wall, twice, while the
+          // sand filter's valve was being worked on.
+          const neverAcknowledged = !lastSentLanded && lastSent === expected;
+          const unapplied =
+            neverAcknowledged &&
+            Date.now() - lastOwnDispatch <= OWN_ORDER_CONFIRM_MS;
+          if (!startup && !unapplied) {
+            if (neverAcknowledged) {
+              // The pump never moved at all: an order it has ignored for longer
+              // than the window. Nobody touched anything — do not blame one.
+              standDown(
+                `Pompe ${pumpName()} toujours ${actual} : l'ordre ${expected} n'a jamais été appliqué. Dérogation : la recette n'insiste plus${progress()}`,
+              );
+              return;
+            }
+            standDown(
+              `Pompe ${pumpName()} passée à ${actual} sans ordre de la recette. Dérogation : la recette n'intervient plus${progress()}`,
+            );
+            return;
+          }
+          // The order really was never applied — but that reading has to be
+          // bounded, or a pump that never listens is nudged once a minute for
+          // ever.
+          if (correctionAttempts >= MAX_CORRECTION_ATTEMPTS) {
+            standDown(
+              `Pompe ${pumpName()} toujours ${actual} après ${MAX_CORRECTION_ATTEMPTS} ordres correctifs. Dérogation : la recette n'insiste plus${progress()}`,
+            );
+            return;
+          }
           if (Date.now() - lastCorrection < CORRECTION_COOLDOWN_MS) return;
           lastCorrection = Date.now();
+          correctionAttempts += 1;
           ctx.log(
             `Réconciliation (${reason}) — pompe ${pumpName()} ${actual} au lieu de ${expected}, ordre correctif${progress()}`,
             "warn",
@@ -1342,6 +1445,7 @@ export function createRecipe(): RecipeDefinition {
         } else {
           ctx.log(logLine(expected, now, reason));
         }
+        lastAutoDesired = expected; // acted on: a later divergence is not a move
         void dispatch(expected);
       }
 
@@ -1379,8 +1483,12 @@ export function createRecipe(): RecipeDefinition {
           // purpose — the H-1 latch existed only in bare auto mode (no window
           // edges to clear it); schedule mode keeps its documented contract of
           // holding the dérogation until the next configured window edge.
-          if (ctx.state.get("override") === true)
+          if (ctx.state.get("override") === true) {
             ctx.state.set("override", false);
+            ctx.log(
+              `Dérogation levée : nouveau jour de filtration sur ${pumpName()}`,
+            );
+          }
           // A manual setpoint change stands until the filtration-day rollover.
           if (ctx.state.get("heaterOverride") === true)
             ctx.state.set("heaterOverride", false);
@@ -1511,6 +1619,11 @@ export function createRecipe(): RecipeDefinition {
        * draw-stopped/draw-started pair on every start.
        */
       function pumpDrawing(now: Date): boolean {
+        // #28 — under a dérogation the recipe is not driving: what the load
+        // actually does is the observed state, not an intent the recipe is not
+        // applying. Without this a pump running by hand under a held claim
+        // would be declared at rest while drawing its full nominal power.
+        if (ctx.state.get("override") === true) return readPumpState() === "ON";
         if (desiredState(now) !== "ON") return false;
         const observed = readPumpState();
         if (observed !== "OFF") return true;
@@ -1522,7 +1635,8 @@ export function createRecipe(): RecipeDefinition {
         // Bail out only when the pump can neither want a claim nor has one to
         // release — otherwise a heating-driven claim would leak once heating
         // ends while runOnSurplus/target are off.
-        if ((!runOnSurplus || !hasTarget) && !heatingWantsPump && !claim) return;
+        if ((!runOnSurplus || !hasTarget) && !heatingWantsPump && !claim)
+          return;
         let enabled = false;
         try {
           enabled =
@@ -1531,9 +1645,18 @@ export function createRecipe(): RecipeDefinition {
         } catch {
           enabled = false;
         }
+        // #28 — a dérogation drops the claim, EXCEPT while the pump is actually
+        // running: that load draws and the arbiter must account for it, and the
+        // grant is also what wakes the ladder back up. Dropping it deadlocked
+        // the recipe — no claim, no grant, so the ladder's output could never
+        // change, and only an off-peak edge hours later lifted the dérogation.
+        // A pump a person left OFF claims nothing: it must not be granted
+        // capacity and restarted under their hands.
+        const runningUnderOverride =
+          ctx.state.get("override") === true && readPumpState() === "ON";
         const want =
           enabled &&
-          ctx.state.get("override") !== true &&
+          (ctx.state.get("override") !== true || runningUnderOverride) &&
           ((runOnSurplus && hasTarget && belowTarget()) || heatingWantsPump);
         if (want && !claim && ctx.helpers.energy) {
           // #26 — retry a denied claim sparsely, not on every 30 s tick: each
@@ -1661,6 +1784,26 @@ export function createRecipe(): RecipeDefinition {
           // rule that actually fired (not the 5-min corrective guard). Inert in
           // schedule-only mode (desiredState only changes at window edges, which
           // the edge timers already own).
+          // #28 — a dérogation ends the moment the disagreement does: the pump
+          // is running again AND the ladder wants it running, so there is
+          // nothing left to disagree about. Switching the pump back on is a
+          // person handing control back, and waiting for the next off-peak edge
+          // to notice is what made the recipe idle for hours. Deliberately
+          // one-sided: agreement on OFF does not lift it, or the arbiter
+          // revoking a grant seconds after someone cut the pump would read as
+          // the person's consent to restart it later.
+          if (
+            ctx.state.get("override") === true &&
+            readPumpState() === "ON" &&
+            desiredState(now) === "ON"
+          ) {
+            ctx.state.set("override", false);
+            lastAutoDesired = "ON"; // already agreed: not a transition to log
+            ctx.log(
+              `Dérogation levée : ${pumpName()} tourne à nouveau${progress()}`,
+            );
+            reconcile("reprise", false);
+          }
           if (hasTarget) {
             const expected = desiredState(now);
             if (expected !== lastAutoDesired) {
@@ -1669,10 +1812,13 @@ export function createRecipe(): RecipeDefinition {
               // dérogation so the recipe resumes control. Schedule mode clears
               // `override` at window edges; auto mode has none, so this is the
               // analog (without it, a manual order latches override forever).
-              if (ctx.state.get("override") === true) {
-                ctx.state.set("override", false);
-                ctx.log(`Dérogation levée (transition auto) sur ${pumpName()}`);
-              }
+              // #28 — a ladder transition no longer lifts a dérogation. It used
+              // to, and that is what switched the pump back on at the off-peak
+              // edge hours after somebody had cut it; the daytime floor did the
+              // same on a day with no off-peak ahead, because a stopped pump
+              // stops accruing daytime seconds. A dérogation now ends only when
+              // the pump is running again (below), at the daily rollover, or —
+              // in schedule mode — at a configured window edge.
               reconcile("cycle", false);
             }
           }
@@ -1811,14 +1957,12 @@ export function createRecipe(): RecipeDefinition {
           if (ev.source?.kind === "recipe") return;
           if (isDeliveryRetry(ev.source)) return;
           if (Date.now() - lastOwnDispatch < OWN_ORDER_GRACE_MS) return;
-          if (ctx.state.get("override") !== true) {
-            ctx.state.set("override", true);
-            ctx.log(
-              hasTarget
-                ? `Ordre manuel détecté sur ${pumpName()}. Dérogation jusqu'à la prochaine transition automatique.`
-                : `Ordre manuel détecté sur ${pumpName()}. Dérogation jusqu'au prochain créneau.`,
-            );
-          }
+          standDown(
+            hasTarget
+              ? `Ordre manuel détecté sur ${pumpName()}. Dérogation jusqu'à ce que la pompe tourne à nouveau ou jusqu'au prochain jour de filtration.`
+              : `Ordre manuel détecté sur ${pumpName()}. Dérogation jusqu'au prochain créneau.`,
+            "info",
+          );
         }),
       );
 
@@ -1839,7 +1983,7 @@ export function createRecipe(): RecipeDefinition {
       // Heater first: if the pump must be corrected to OFF right at startup,
       // the setpoint has to be parked at idle before that order goes out.
       reconcileHeater("démarrage");
-      reconcile("démarrage", true);
+      reconcile("démarrage", true, true);
       lastAutoDesired = desiredState(new Date());
 
       guardTimer = setInterval(() => {
