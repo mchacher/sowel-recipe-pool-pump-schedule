@@ -99,14 +99,21 @@ dispatch, so the two are separable:
   log. Symmetrical on purpose: a pump switched ON by hand is left running too.
   A time window alone was not enough: a cut ten seconds after the recipe started
   the pump still read as "the device did not apply it".
-- An order the pump **never acknowledged**, within 2 min, is still corrected:
-  throttled by the 1 min cooldown and capped at **two orders**, since a pump
-  that never listens would otherwise be nudged once a minute for ever. The
-  budget comes back when the divergence resolves.
+- An order the pump **never acknowledged** is still corrected, throttled by the
+  1 min cooldown and capped at **two orders**, since a pump that never listens
+  would otherwise be nudged for ever. The budget comes back when the divergence
+  resolves. The window this is allowed in deliberately outlasts the 5 min
+  periodic guard: a device that ignores an order sends no report, so the guard
+  is the only thing that can ever notice, and a shorter window meant it always
+  arrived too late and the recipe stood down on a pump that had not moved.
 
-A pump that genuinely drops out on its own is therefore no longer switched back
-on: the recipe stands down until its next scheduled action. That is the accepted
-trade-off — never restart a machine someone has their hands on.
+A pump that genuinely drops out on its own — a tripped breaker, a relay that
+died — is therefore no longer switched back on once the recipe has seen it
+running: the recipe stands down and says so. That is the accepted trade-off,
+never restart a machine someone has their hands on. One case is deliberately
+not covered: a pump cut while the instance itself is down (a container update, a
+parameter change) is corrected at the next start, since a restarting recipe has
+no way to know who moved it.
 
 **Coming back.** A dérogation ends three ways, and a rung edge is not one of
 them:
@@ -115,10 +122,13 @@ them:
    to disagree about. Agreement on OFF does not count, or the arbiter revoking a
    grant seconds after someone cut the pump would read as consent to restart it
    later.
-2. The **06:00 rollover**, a new filtration day. This is the backstop that keeps
-   a forgotten dérogation from being permanent, and the only thing that resumes
-   a pump left off — the following morning, never the same day.
-3. In **schedule mode**, a configured window edge, as it always has.
+2. The **06:00 rollover**, a new filtration day, in auto (target) mode. This is
+   the backstop that keeps a forgotten dérogation from being permanent, and the
+   only thing that resumes a pump left off — the following morning, never the
+   same day.
+3. A configured **window edge**, wherever windows are set, as it always has.
+   That is what ends a dérogation in schedule mode, which has no daily target to
+   roll over.
 
 Until v1.9.0 any ladder transition lifted it, which is what switched the pump
 back on at the off-peak edge hours after somebody had cut it. On a day with no

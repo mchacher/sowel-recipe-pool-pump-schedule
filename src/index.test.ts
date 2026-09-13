@@ -2565,26 +2565,64 @@ describe("uncommanded change: the guarantees (#28)", () => {
     handle.stop();
   });
 
-  it("a resolved divergence gives the nudge budget back", async () => {
-    vi.setSystemTime(new Date("2026-04-19T12:00:00"));
-    const { ctx, orderCalls, state, setPumpState, emit } = buildCtx({
+  it("a redundant window-edge order is acknowledged on the spot", async () => {
+    // Review finding: a window edge re-asserts the desired state even when the
+    // device already holds it. No state change means no report, so the order
+    // stayed "never acknowledged" for the whole window and a cut 20 s later was
+    // argued with — the 2026-09-13 incident, reopened twice a day per window.
+    vi.setSystemTime(new Date("2026-04-19T09:59:00"));
+    const { ctx, orderCalls, state, setPumpState, emit } = buildCtx();
+    const handle = createRecipe().createInstance(
+      { zone: "Z1", pump: "P1", slot1_start: "10:00", slot1_end: "14:00" },
+      ctx as never,
+    );
+    expect(orderCalls.length).toBe(0);
+
+    // Someone starts the pump by hand a minute before the window opens.
+    setPumpState("ON");
+    emit("equipment.data.changed", { equipmentId: "P1", alias: "state" });
+    expect(state.get("override")).toBe(true);
+
+    // The 10:00 edge clears the dérogation by contract and re-asserts ON on a
+    // pump that is already running: a redundant order.
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(orderCalls.length).toBe(1);
+    expect(state.get("override")).not.toBe(true);
+
+    // Cut at the wall 20 s later. That order landed, so this is a person.
+    await vi.advanceTimersByTimeAsync(20_000);
+    setPumpState("OFF");
+    emit("equipment.data.changed", { equipmentId: "P1", alias: "state" });
+    await vi.advanceTimersByTimeAsync(6 * 60_000);
+    expect(orderCalls.length).toBe(1);
+    expect(state.get("override")).toBe(true);
+    handle.stop();
+  });
+
+  it("the periodic guard can still nudge a device that never answers", async () => {
+    // Review finding: the confirmation window was shorter than the 5 min guard,
+    // and a device that ignores an order emits no report — so nothing could ever
+    // reconcile inside the window. The recipe stood down at the first guard tick
+    // on a pump that had not moved, abandoning the filtration day.
+    vi.setSystemTime(new Date("2026-04-19T12:00:00")); // inside the window
+    const { ctx, orderCalls, state, setPumpState, logLines } = buildCtx({
       initialPumpState: "OFF",
     });
     const handle = createRecipe().createInstance(
       { zone: "Z1", pump: "P1", slot1_start: "10:00", slot1_end: "14:00" },
       ctx as never,
     );
-    expect(orderCalls.length).toBe(1); // startup nudge: attempt 1
+    expect(orderCalls.length).toBe(1); // startup nudge
 
-    // The device applies it after all, which clears the budget.
-    setPumpState("ON");
-    emit("equipment.data.changed", { equipmentId: "P1", alias: "state" });
-    expect(state.get("override")).not.toBe(true);
-
-    // A later unacknowledged order gets its full budget again rather than
-    // standing down on the first divergence.
-    await vi.advanceTimersByTimeAsync(2 * 3_600_000); // 14:00 end edge → OFF
-    expect(state.get("override")).not.toBe(true);
+    // The device answers nothing and stays OFF, minute after minute.
+    for (let i = 0; i < 12; i++) {
+      setPumpState("OFF");
+      await vi.advanceTimersByTimeAsync(60_000);
+    }
+    // The guard got its second nudge in, then gave up — on the right grounds.
+    expect(orderCalls.length).toBe(2);
+    expect(state.get("override")).toBe(true);
+    expect(logLines.some((l) => l.includes("n'insiste plus"))).toBe(true);
     handle.stop();
   });
 });
