@@ -763,6 +763,13 @@ export function createRecipe(): RecipeDefinition {
       let reportNeedFailureLogged = false;
       let lastCorrection = 0;
       let correctionAttempts = 0; // #28 — bounded fight, reset when it resolves
+      // #28 — the sharp signal. A pump that reported the state we ordered has
+      // applied it; anything that moves it afterwards is a hand, however soon.
+      // Only an order the device NEVER acknowledged can justify a corrective
+      // one. Without this, a cut 10 s after the recipe started the pump read as
+      // "the device did not apply it" and was argued with.
+      let lastSent: "ON" | "OFF" | null = null;
+      let lastSentLanded = false;
       let lastAccountAt: number | null = null;
       let lastAutoDesired: "ON" | "OFF" | null = null; // last auto desired-state, for transition logging
       let deadlineLatched = false; // once the deadline catch-up engages tonight, hold it (no threshold chatter)
@@ -790,6 +797,8 @@ export function createRecipe(): RecipeDefinition {
 
       async function sendOrder(value: "ON" | "OFF"): Promise<void> {
         lastOwnDispatch = Date.now();
+        lastSent = value;
+        lastSentLanded = false;
         if (ctx.dispatchOrder) {
           await ctx.dispatchOrder(pumpId, "state", value);
         } else {
@@ -1347,44 +1356,59 @@ export function createRecipe(): RecipeDefinition {
         corrective: boolean,
         startup = false,
       ): void {
-        if (ctx.state.get("override") === true) return;
         const now = new Date();
+        const actual = readPumpState();
+        if (actual !== null && actual === lastSent) lastSentLanded = true;
+        if (ctx.state.get("override") === true) {
+          // #28 — dérogations are routine now, so the labels must not freeze on
+          // an intent the recipe is not applying: `status` follows the pump, so
+          // stop() sends its spec 082 OFF when the pump is actually running and
+          // stays quiet when it is not.
+          if (actual !== null) {
+            setIfChanged("status", actual === "ON" ? "running" : "idle");
+            setIfChanged("currentSlot", null);
+          }
+          return;
+        }
         const expected = desiredState(now);
         syncStateLabels(now, expected);
-        const actual = readPumpState();
         if (actual === null) return;
         if (actual === expected) {
           correctionAttempts = 0; // the divergence resolved: fresh budget
           return;
         }
         if (corrective && hasTarget && expected !== lastAutoDesired) {
-          // The 5-min guard caught an auto transition before the 30 s tick did:
-          // log it as the normal rule-named transition, not a drift correction.
+          // The ladder itself moved and the 30 s tick has not acted on it yet:
+          // that is a transition, not a divergence somebody caused. Log it as
+          // the normal rule-named transition, not a drift correction. This is
+          // why `lastAutoDesired` is refreshed on every dispatch below — left
+          // stale for a tick, it made a hand-cut look like a ladder move and
+          // waved it straight past the stand-down gate (#28).
           lastAutoDesired = expected;
           ctx.log(logLine(expected, now, reason));
         } else if (corrective) {
           // #28 — a divergence the recipe did not cause is a PERSON, not a
           // drift, and a person is never argued with. The corrective order
           // exists for one case only (issue #1): a device that did not apply an
-          // order the recipe just sent, which always carries a recent own
-          // dispatch. Past that window nothing but a hand moved the pump — a
-          // wall switch emits no order event, only a state report, so this is
-          // the only place that case can be caught. Latch the dérogation and
-          // send nothing: on 2026-09-13 the recipe switched the pump back on 14 s
-          // after it was cut at the wall, twice, while the sand filter's valve
-          // was being worked on.
-          if (!startup && Date.now() - lastOwnDispatch > OWN_ORDER_CONFIRM_MS) {
+          // order the recipe sent, which means an order it never acknowledged,
+          // recently. A wall switch emits no order event, only a state report,
+          // so this is the only place that case can be caught. Latch the
+          // dérogation and send nothing: on 2026-09-13 the recipe switched the
+          // pump back on 14 s after it was cut at the wall, twice, while the
+          // sand filter's valve was being worked on.
+          const unapplied =
+            !lastSentLanded &&
+            lastSent === expected &&
+            Date.now() - lastOwnDispatch <= OWN_ORDER_CONFIRM_MS;
+          if (!startup && !unapplied) {
             standDown(
               `Pompe ${pumpName()} passée à ${actual} sans ordre de la recette. Dérogation : la recette n'intervient plus${progress()}`,
             );
             return;
           }
-          // The divergence IS inside the own-order window, so it reads as a
-          // device that did not apply what we sent — but that reading has to be
-          // bounded. Every corrective order refreshes the window, so without a
-          // cap a pump that never listens is hammered once a minute for ever,
-          // and a person acting just after one of our orders would be argued
-          // with exactly as before (#28).
+          // The order really was never applied — but that reading has to be
+          // bounded, or a pump that never listens is nudged once a minute for
+          // ever.
           if (correctionAttempts >= MAX_CORRECTION_ATTEMPTS) {
             standDown(
               `Pompe ${pumpName()} toujours ${actual} après ${MAX_CORRECTION_ATTEMPTS} ordres correctifs. Dérogation : la recette n'insiste plus${progress()}`,
@@ -1401,6 +1425,7 @@ export function createRecipe(): RecipeDefinition {
         } else {
           ctx.log(logLine(expected, now, reason));
         }
+        lastAutoDesired = expected; // acted on: a later divergence is not a move
         void dispatch(expected);
       }
 
@@ -1432,14 +1457,32 @@ export function createRecipe(): RecipeDefinition {
         const today = filtrationDay(now);
         if (ctx.state.get("day") === today) return;
         const firstInit = ctx.state.get("day") == null;
+        // #28 — window-less schedule mode has no edge to clear a dérogation and
+        // no target to roll over, so a single hand-order latched it for ever.
+        // The day boundary is its only backstop.
+        if (
+          !firstInit &&
+          !hasTarget &&
+          windows.length === 0 &&
+          ctx.state.get("override") === true
+        ) {
+          ctx.state.set("override", false);
+          ctx.log(
+            `Dérogation levée : nouveau jour de filtration sur ${pumpName()}`,
+          );
+        }
         if (!firstInit && hasTarget) {
           // Auto-mode backstop: a genuine day boundary lifts any lingering manual
           // dérogation so it never outlives the filtration day. Auto-only on
           // purpose — the H-1 latch existed only in bare auto mode (no window
           // edges to clear it); schedule mode keeps its documented contract of
           // holding the dérogation until the next configured window edge.
-          if (ctx.state.get("override") === true)
+          if (ctx.state.get("override") === true) {
             ctx.state.set("override", false);
+            ctx.log(
+              `Dérogation levée : nouveau jour de filtration sur ${pumpName()}`,
+            );
+          }
           // A manual setpoint change stands until the filtration-day rollover.
           if (ctx.state.get("heaterOverride") === true)
             ctx.state.set("heaterOverride", false);
@@ -1763,16 +1806,13 @@ export function createRecipe(): RecipeDefinition {
               // dérogation so the recipe resumes control. Schedule mode clears
               // `override` at window edges; auto mode has none, so this is the
               // analog (without it, a manual order latches override forever).
-              // #28 — only a transition TOWARDS ON lifts a dérogation. Standing
-              // down releases the surplus claim, which drops the ladder to OFF
-              // one tick later; reading that as "the next automatic transition"
-              // lifted the dérogation the person had just caused, in the very
-              // tick that followed it. A transition to OFF also has nothing to
-              // do while someone holds the pump: it dispatches no order.
-              if (ctx.state.get("override") === true && expected === "ON") {
-                ctx.state.set("override", false);
-                ctx.log(`Dérogation levée (transition auto) sur ${pumpName()}`);
-              }
+              // #28 — a ladder transition no longer lifts a dérogation. It used
+              // to, and that is what switched the pump back on at the off-peak
+              // edge hours after somebody had cut it; the daytime floor did the
+              // same on a day with no off-peak ahead, because a stopped pump
+              // stops accruing daytime seconds. A dérogation now ends only when
+              // the pump is running again (below), at the daily rollover, or —
+              // in schedule mode — at a configured window edge.
               reconcile("cycle", false);
             }
           }

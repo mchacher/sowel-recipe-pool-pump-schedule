@@ -93,23 +93,37 @@ The corrective reconciliation exists for one case (#1): a device that does not
 apply an order the recipe just sent. That case always carries a recent own
 dispatch, so the two are separable:
 
-- A divergence **outside** the own-order window (2 min) is a person. The recipe
-  latches its dérogation, sends nothing, and says so in its log. Symmetrical on
-  purpose: a pump switched ON by hand is left running too.
-- A divergence **inside** that window is still corrected, throttled by the 1 min
-  cooldown and capped at **two orders**. Each correction refreshes the window,
-  so an unbounded retry would hammer a dead pump for ever — and would argue with
-  someone acting just after one of the recipe's own orders.
+- An order the pump **acknowledged** — it reported the state that was ordered —
+  has been applied, so anything that moves it afterwards is a hand, however soon
+  after. The recipe latches its dérogation, sends nothing, and says so in its
+  log. Symmetrical on purpose: a pump switched ON by hand is left running too.
+  A time window alone was not enough: a cut ten seconds after the recipe started
+  the pump still read as "the device did not apply it".
+- An order the pump **never acknowledged**, within 2 min, is still corrected:
+  throttled by the 1 min cooldown and capped at **two orders**, since a pump
+  that never listens would otherwise be nudged once a minute for ever. The
+  budget comes back when the divergence resolves.
 
 A pump that genuinely drops out on its own is therefore no longer switched back
 on: the recipe stands down until its next scheduled action. That is the accepted
 trade-off — never restart a machine someone has their hands on.
 
-**Coming back.** The dérogation ends when the disagreement does: the pump is
-running again **and** the ladder wants it running. Agreement on OFF does not
-count, or the arbiter revoking a grant seconds after someone cut the pump would
-read as consent to restart it later; for the same reason only a transition
-towards ON lifts a dérogation.
+**Coming back.** A dérogation ends three ways, and a rung edge is not one of
+them:
+
+1. The pump is **running again** and the ladder wants it running — nothing left
+   to disagree about. Agreement on OFF does not count, or the arbiter revoking a
+   grant seconds after someone cut the pump would read as consent to restart it
+   later.
+2. The **06:00 rollover**, a new filtration day. This is the backstop that keeps
+   a forgotten dérogation from being permanent, and the only thing that resumes
+   a pump left off — the following morning, never the same day.
+3. In **schedule mode**, a configured window edge, as it always has.
+
+Until v1.9.0 any ladder transition lifted it, which is what switched the pump
+back on at the off-peak edge hours after somebody had cut it. On a day with no
+off-peak ahead the daytime floor did the same, because a stopped pump stops
+accruing daytime seconds.
 
 **The claim follows the pump, not the recipe.** A dérogation used to drop the
 surplus claim outright, which deadlocked the recipe: no claim, no grant, so the
@@ -126,8 +140,9 @@ energy page does.
 ### Manual dérogation (v1.8.2, #24)
 
 An order on the pump that the recipe did not send latches a **dérogation**: the
-recipe stands down until the next auto transition (a change of the ladder's
-output), or the 06:00 rollover.
+recipe stands down. Since v1.9.0 it comes back only when the pump is running and
+the ladder agrees, at the 06:00 rollover, or at a schedule-mode window edge — a
+ladder transition on its own no longer lifts one (#28).
 
 Two things are deliberately NOT a manual order: the recipe's own dispatches, and
 the core replaying a delivery it could not make. When an equipment or its
@@ -136,11 +151,12 @@ could not deliver, stamped `{kind: "external", channel: "delivery-retry"}` — t
 is the recipe's own order coming back, not a human's, and it no longer latches a
 dérogation.
 
-On a real manual order the dérogation can be long: the claim is released, so
-`arbiterGranted` can no longer turn true, so the solar-surplus rung reads OFF and
-cannot itself produce the transition that would lift the dérogation. On a day
-with no off-peak window ahead it then holds until the 06:00 rollover. That is
-deliberate, and it matches the core: the arbiter suspends the same equipment for
+On a real manual order the dérogation can be long, and deliberately so. It used
+to be long for the wrong reason: the claim was released outright, so
+`arbiterGranted` could never turn true again and the recipe had no way to notice
+anything had changed. Since v1.9.0 a pump observed **running** keeps its claim,
+so a grant can still arrive and hand control back (#28). It matches the core
+either way: the arbiter suspends the same equipment for
 `overrideTtlS` (2 h by default) on that same order, so a claim taken meanwhile
 would only come back denied `override-active`. Standing down is the recipe
 agreeing with the arbiter that a human is driving. The bug worth fixing was the

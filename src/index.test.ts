@@ -138,12 +138,18 @@ function makeArbiter(opts?: { enabled?: boolean; denied?: boolean }) {
   let status: "pending" | "granted" | "denied" | "released" = "pending";
   let req: { onGranted: () => void; onRevoked: (r: string) => void } | null =
     null;
+  /** Spec 166 — every `reportNeed` value pushed while the claim is granted,
+   *  mirroring the real arbiter (which throws the declaration away otherwise). */
+  const needs: boolean[] = [];
   const handle = {
     id: "claim-1",
     status: () => status,
     deniedReason: opts?.denied ? "not-profiled" : undefined,
     release: () => {
       status = "released";
+    },
+    reportNeed: (need: boolean) => {
+      if (status === "granted") needs.push(need);
     },
   };
   return {
@@ -175,6 +181,7 @@ function makeArbiter(opts?: { enabled?: boolean; denied?: boolean }) {
       }
     },
     claimed: () => req !== null && status !== "released",
+    needs,
   };
 }
 
@@ -2419,6 +2426,165 @@ describe("uncommanded change: stand down (#28)", () => {
     await vi.advanceTimersByTimeAsync(60 * 60_000);
     expect(state.get("override")).toBe(true);
     expect(orderCalls.filter((c) => c.value === "ON").length).toBe(1);
+    handle.stop();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// #28, review follow-ups: what must NOT happen once someone holds the pump.
+// ---------------------------------------------------------------------------
+describe("uncommanded change: the guarantees (#28)", () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  const TARIFF = {
+    configured: true,
+    offPeakToday: [
+      { start: "00:04", end: "05:34" },
+      { start: "14:34", end: "17:04" },
+    ],
+    isOffPeakNow: null,
+  };
+  const SUN = { sunrise: "07:10", sunset: "20:10", isDaylight: true };
+  const AUTO_SURPLUS = {
+    zone: "Z1",
+    pump: "P1",
+    waterTempSensor: "WT1",
+    runOnSurplus: true,
+  };
+
+  /** Grant the surplus and let the pump start, device acknowledging the order. */
+  async function startOnSurplus(t: string) {
+    vi.setSystemTime(new Date(t));
+    const arb = makeArbiter();
+    const ctxBits = buildCtx({
+      waterTemp: 24,
+      energy: arb.energy,
+      sunlight: SUN,
+      tariff: TARIFF,
+    });
+    const handle = createRecipe().createInstance(
+      AUTO_SURPLUS,
+      ctxBits.ctx as never,
+    );
+    arb.grant();
+    await vi.advanceTimersByTimeAsync(100);
+    // The device reports back that it applied the ON.
+    ctxBits.emit("equipment.data.changed", { equipmentId: "P1", alias: "state" });
+    return { arb, handle, ...ctxBits };
+  }
+
+  it("no rung edge restarts a pump somebody cut, not even off-peak", async () => {
+    // The review caught this: the dérogation used to end at the next ladder
+    // transition, so a pump cut at 09:10 came back on at the 14:34 off-peak
+    // edge — and on a day with no off-peak ahead, at the daytime floor, since a
+    // stopped pump stops accruing daytime seconds.
+    const { arb, handle, state, orderCalls, setPumpState, emit } =
+      await startOnSurplus("2026-09-13T09:10:00");
+    const ons = () => orderCalls.filter((c) => c.value === "ON").length;
+    expect(ons()).toBe(1);
+
+    await vi.advanceTimersByTimeAsync(30 * 60_000);
+    setPumpState("OFF"); // cut at the wall button
+    emit("equipment.data.changed", { equipmentId: "P1", alias: "state" });
+    await vi.advanceTimersByTimeAsync(100);
+    expect(state.get("override")).toBe(true);
+
+    // Across the off-peak edge, the daytime floor and sunset: nothing.
+    await vi.advanceTimersByTimeAsync(8 * 3_600_000);
+    expect(ons()).toBe(1);
+    expect(state.get("override")).toBe(true);
+    expect(arb.claimed()).toBe(false);
+    handle.stop();
+  });
+
+  it("an order the device acknowledged makes any later change a person's", async () => {
+    // The review's other hole: a cut 10 s after the recipe's own ON used to
+    // fall inside the own-order window and be argued with. A pump that reported
+    // the state we ordered has applied it; what moves it afterwards is a hand.
+    const { handle, state, orderCalls, setPumpState, emit } =
+      await startOnSurplus("2026-09-13T09:10:00");
+    expect(orderCalls.filter((c) => c.value === "ON").length).toBe(1);
+
+    await vi.advanceTimersByTimeAsync(10_000); // 10 s, far inside the 2 min window
+    setPumpState("OFF");
+    emit("equipment.data.changed", { equipmentId: "P1", alias: "state" });
+    await vi.advanceTimersByTimeAsync(5 * 60_000);
+    expect(orderCalls.filter((c) => c.value === "ON").length).toBe(1);
+    expect(state.get("override")).toBe(true);
+    handle.stop();
+  });
+
+  it("declares the pump's real draw to the arbiter under a dérogation", async () => {
+    // Spec 166: while a claim is granted the recipe says whether the load needs
+    // current. Under a dérogation the recipe is not driving, so the observed
+    // state is the only truthful answer — a pump running by hand under a held
+    // claim must not be declared at rest while drawing its nominal power.
+    const { arb, handle, state, setPumpState, emit } = await startOnSurplus(
+      "2026-09-13T09:10:00",
+    );
+    await vi.advanceTimersByTimeAsync(30 * 60_000);
+    expect(arb.needs.at(-1)).toBe(true); // running under the recipe's control
+
+    setPumpState("OFF"); // cut by hand
+    emit("equipment.data.changed", { equipmentId: "P1", alias: "state" });
+    await vi.advanceTimersByTimeAsync(100);
+    expect(state.get("override")).toBe(true);
+
+    // Switched back on by hand: the claim comes back and the declaration says
+    // the load draws, even though the recipe is not the one driving it.
+    setPumpState("ON");
+    emit("equipment.data.changed", { equipmentId: "P1", alias: "state" });
+    await vi.advanceTimersByTimeAsync(31_000);
+    arb.grant();
+    await vi.advanceTimersByTimeAsync(31_000);
+    expect(arb.needs.at(-1)).toBe(true);
+    handle.stop();
+  });
+
+  it("a new filtration day is the backstop for a pump left off", async () => {
+    // The pump is never restarted the same day, so the 06:00 rollover is what
+    // keeps a forgotten dérogation from being permanent.
+    const { handle, state, setPumpState, emit, logLines } =
+      await startOnSurplus("2026-09-13T05:00:00");
+    await vi.advanceTimersByTimeAsync(30 * 60_000);
+    setPumpState("OFF");
+    emit("equipment.data.changed", { equipmentId: "P1", alias: "state" });
+    await vi.advanceTimersByTimeAsync(100);
+    expect(state.get("override")).toBe(true);
+
+    await vi.advanceTimersByTimeAsync(90 * 60_000); // past 06:00
+    expect(state.get("override")).toBe(false);
+    expect(
+      logLines.some((l) => l.includes("nouveau jour de filtration")),
+    ).toBe(true);
+    handle.stop();
+  });
+
+  it("a resolved divergence gives the nudge budget back", async () => {
+    vi.setSystemTime(new Date("2026-04-19T12:00:00"));
+    const { ctx, orderCalls, state, setPumpState, emit } = buildCtx({
+      initialPumpState: "OFF",
+    });
+    const handle = createRecipe().createInstance(
+      { zone: "Z1", pump: "P1", slot1_start: "10:00", slot1_end: "14:00" },
+      ctx as never,
+    );
+    expect(orderCalls.length).toBe(1); // startup nudge: attempt 1
+
+    // The device applies it after all, which clears the budget.
+    setPumpState("ON");
+    emit("equipment.data.changed", { equipmentId: "P1", alias: "state" });
+    expect(state.get("override")).not.toBe(true);
+
+    // A later unacknowledged order gets its full budget again rather than
+    // standing down on the first divergence.
+    await vi.advanceTimersByTimeAsync(2 * 3_600_000); // 14:00 end edge → OFF
+    expect(state.get("override")).not.toBe(true);
     handle.stop();
   });
 });
