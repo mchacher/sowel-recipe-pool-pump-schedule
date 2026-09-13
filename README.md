@@ -82,6 +82,47 @@ all for four days while the site exported 10–15 kWh a day. Restarting the
 instance was the only way out. The heater claim already had this handling;
 the pump claim now has the same.
 
+### A change the recipe did not command is a person (v1.9.0, #28)
+
+A wall switch emits no order, only a state report, so until v1.9.0 the recipe
+read it as device drift and **switched the pump back on**. On 2026-09-13 the
+pump was cut at the Sonoff's button while the sand filter was being cleaned,
+and came back on 14 s later, twice.
+
+The corrective reconciliation exists for one case (#1): a device that does not
+apply an order the recipe just sent. That case always carries a recent own
+dispatch, so the two are separable:
+
+- A divergence **outside** the own-order window (2 min) is a person. The recipe
+  latches its dérogation, sends nothing, and says so in its log. Symmetrical on
+  purpose: a pump switched ON by hand is left running too.
+- A divergence **inside** that window is still corrected, throttled by the 1 min
+  cooldown and capped at **two orders**. Each correction refreshes the window,
+  so an unbounded retry would hammer a dead pump for ever — and would argue with
+  someone acting just after one of the recipe's own orders.
+
+A pump that genuinely drops out on its own is therefore no longer switched back
+on: the recipe stands down until its next scheduled action. That is the accepted
+trade-off — never restart a machine someone has their hands on.
+
+**Coming back.** The dérogation ends when the disagreement does: the pump is
+running again **and** the ladder wants it running. Agreement on OFF does not
+count, or the arbiter revoking a grant seconds after someone cut the pump would
+read as consent to restart it later; for the same reason only a transition
+towards ON lifts a dérogation.
+
+**The claim follows the pump, not the recipe.** A dérogation used to drop the
+surplus claim outright, which deadlocked the recipe: no claim, no grant, so the
+ladder's output could never change, and only an off-peak edge hours later woke
+it up. While the pump is observed **running** under a dérogation its claim is
+held — that load draws and the arbiter must account for it, and the grant is
+what wakes the ladder. A pump left OFF claims nothing, so it cannot be granted
+surplus and restarted under someone's hands.
+
+Note the core arbiter also suspends the equipment for `overrideTtlS` (2 h) on a
+manual order, which no recipe can lift; the "reprendre le pilotage" button on the
+energy page does.
+
 ### Manual dérogation (v1.8.2, #24)
 
 An order on the pump that the recipe did not send latches a **dérogation**: the
