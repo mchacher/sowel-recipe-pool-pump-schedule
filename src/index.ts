@@ -14,8 +14,8 @@
  *    claims capacity from the arbiter and runs on granted surplus. Absent
  *    arbiter or production, this is inert and the schedule stands alone.
  *
- * At each start the recipe fires `executeOrder(pumpId, "state", "ON")`,
- * at each end `executeOrder(pumpId, "state", "OFF")`. End times earlier
+ * At each start the recipe fires `dispatchOrder(pumpId, "state", "ON")`,
+ * at each end `dispatchOrder(pumpId, "state", "OFF")`. End times earlier
  * than the corresponding start time cross midnight naturally —
  * `msUntilTime` schedules each timer independently.
  *
@@ -130,11 +130,6 @@ interface EquipmentDataBindingValue {
 interface EquipmentManager {
   getById(id: string): Equipment | null;
   getDataBindingsWithValues?(id: string): EquipmentDataBindingValue[];
-  executeOrder(
-    equipmentId: string,
-    alias: string,
-    value: unknown,
-  ): Promise<{ success: boolean; error?: string }>;
 }
 
 // Spec 140 capacity-arbiter helpers, mirrored from core (recipes don't import
@@ -202,8 +197,9 @@ interface RecipeContext {
     // home has no production. The recipe then runs its schedule unchanged.
     energy?: EnergyHelpers;
   };
-  /** Order dispatch with recipe source attribution (newer cores). */
-  dispatchOrder?(
+  // Spec 101 — dispatches an order attributed to this recipe instance, so the
+  // activity feed names the recipe as its source.
+  dispatchOrder(
     equipmentId: string,
     alias: string,
     value: unknown,
@@ -809,11 +805,7 @@ export function createRecipe(): RecipeDefinition {
         // re-asserts unconditionally, so schedule mode opened that hole twice a
         // day per window: a cut 20 s after it reopened the original incident.
         lastSentLanded = readPumpState() === value;
-        if (ctx.dispatchOrder) {
-          await ctx.dispatchOrder(pumpId, "state", value);
-        } else {
-          await ctx.equipmentManager.executeOrder(pumpId, "state", value);
-        }
+        await ctx.dispatchOrder(pumpId, "state", value);
       }
 
       async function dispatch(value: "ON" | "OFF"): Promise<void> {
@@ -901,15 +893,7 @@ export function createRecipe(): RecipeDefinition {
         lastHeaterDispatch = Date.now();
         lastCommandedSetpoint = value;
         try {
-          if (ctx.dispatchOrder) {
-            await ctx.dispatchOrder(heaterId, "setpoint", value);
-          } else {
-            await ctx.equipmentManager.executeOrder(
-              heaterId,
-              "setpoint",
-              value,
-            );
-          }
+          await ctx.dispatchOrder(heaterId, "setpoint", value);
         } catch (err: unknown) {
           const msg = err instanceof Error ? err.message : String(err);
           ctx.log(
