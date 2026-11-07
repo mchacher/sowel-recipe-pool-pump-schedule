@@ -61,14 +61,6 @@ function buildCtx(
         id === "WT1"
           ? [{ alias: "temperature", value: waterTemp }]
           : [{ alias: "state", value: pumpState }],
-      executeOrder: async (
-        equipmentId: string,
-        alias: string,
-        value: unknown,
-      ) => {
-        recordOrder(equipmentId, alias, value);
-        return { success: true };
-      },
     },
     dispatchOrder: async (
       equipmentId: string,
